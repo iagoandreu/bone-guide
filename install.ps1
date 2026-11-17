@@ -9,7 +9,7 @@ New-Item -ItemType Directory -Force -Path $dst | Out-Null
 $cache = Join-Path $dst '__pycache__'
 if (Test-Path -LiteralPath $cache) { Remove-Item -LiteralPath $cache -Recurse -Force }
 
-foreach ($f in @('BoneGuide.py', 'bg_core.py', 'bg_engine.py', 'BoneGuide.manifest')) {
+foreach ($f in @('BoneGuide.py', 'bg_core.py', 'bg_engine.py', 'bg_brep.py', 'bg_slab.py', 'BoneGuide.manifest')) {
     Copy-Item -LiteralPath (Join-Path $src $f) -Destination $dst -Force
 }
 # Copy-Item -Recurse into a directory that ALREADY holds one of the same name

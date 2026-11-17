@@ -31,6 +31,7 @@ import adsk.fusion
 
 import array
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -59,11 +60,12 @@ CMD_NAMES = {CMD_CURVE: 'Bone Curve', CMD_BASE: 'Guide Base'}
 PANELS = ['SolidCreatePanel', 'SurfaceCreatePanel']
 
 DEFAULTS = {'influence': 0.0, 'smooth_mm': 1.0, 'clearance': 0.2, 'thickness': 3.5,
-            'round': 1.0, 'round_contact': 0.0, 'voxel': 1, 'curve_smooth': 0.5,
+            'round': 2.0, 'round_contact': 0.2, 'voxel': 1, 'curve_smooth': 0.5,
             'fit_spacing': 3.0, 'margin': 2.4, 'margin2': 1.0, 'closing': 3.5,
             'closing_mode': 0, 'join': True,
-            'guide_d': 5.2, 'guide_h': 10.0, 'guide_clear': 0.5, 'guide_top_round': 1.0,
-            'guide_edge_round': 1.0, 'guide_spin': 0.0, 'hole_d': 0.0, 'output': 1,
+            'guide_d': 7.0, 'guide_h': 12.1, 'guide_clear': 0.2, 'guide_top_round': 1.5,
+            'guide_edge_round': 0.0, 'guide_spin': 0.0, 'hole_d': 3.5, 'output': 1,
+            'pent_d': 6.0, 'pent_hole_d': 2.0, 'pent_h': 10.5, 'pent_top_round': 1.0,
             'facet_tol': 0.05}
 # the drill guides of a distal radius test case, measured: hole = the reference
 # cylinder, outside 5.2 mm (a pentagon inscribed in it), top 10 mm above the bone along the
@@ -230,9 +232,12 @@ def python_cmd():
 
 
 def _engine_mtime():
+    """The newest of the engine's files: the process keeps what it imported."""
     try:
-        return os.path.getmtime(ENGINE)
-    except OSError:
+        return max(os.path.getmtime(os.path.join(ADDIN_DIR, f))
+                   for f in ('bg_engine.py', 'bg_slab.py') if
+                   os.path.exists(os.path.join(ADDIN_DIR, f)))
+    except (OSError, ValueError):
         return None
 
 
@@ -271,6 +276,18 @@ class Server:
                 self.proc.kill()
             except Exception:
                 pass
+
+
+def engine():
+    """The resident engine, with no bone loaded on its account."""
+    st = state()
+    srv = st.server
+    stale = srv is not None and getattr(srv, 'engine_mtime', None) != _engine_mtime()
+    if srv is None or stale or not srv.alive():
+        if srv is not None:
+            srv.close()
+        srv = st.server = Server()
+    return srv
 
 
 def server_for(body):
@@ -980,6 +997,84 @@ def build_base(app, ui, bone, curves, holes, p, tubes=()):
     return body, res
 
 
+def guide_from(app, bone, curves, tubes, holes, p):
+    """Guide Base, B-Rep: the engine fits the slab from the bone's triangles
+    (written once per session), Fusion assembles and cuts it. The full bone is
+    loaded into the engine only when there are tubes to stand on it."""
+    # the base needs the bone's triangles (written once per session); tubes on a
+    # solid bone need nothing but Fusion, on a mesh bone the engine's ray
+    paths = write_mesh(bone) if curves else None
+    mesh_bone = adsk.fusion.MeshBody.cast(bone) is not None
+    if tubes and mesh_bone:
+        ask = server_for(bone).ask
+    else:
+        ask = engine().ask
+    body, rep = _brep().build_guide(app, bone, curves, tubes, holes, p, ask, paths, log)
+    log('guide base: %s' % json.dumps({k: v for k, v in rep.items() if k != 'fit'}))
+    log('guide base fit: %s' % json.dumps(rep.get('fit')))
+    return body, rep
+
+
+def brep_report(p, rep):
+    f = rep.get('fit') or {}
+    if rep.get('tubes_only'):
+        txt = ('No outline picked: %s only, %s, %.0f mm3, in %.0f s.'
+               % (rep.get('body', 'guide tubes'), 'all solid' if rep.get('solid') else
+                  'NOT all solid', rep.get('volume_mm3', 0.0), rep.get('secs', 0.0)))
+        for r in rep.get('tubes') or []:
+            if r.get('error'):
+                txt += '\n  %s: %s' % (r['name'], r['error'])
+            else:
+                txt += '\n  %s: %s, axis %.0f deg off the bone normal%s' % (
+                    r['name'], 'pentagon' if r['kind'] == 'pent' else 'cylinder',
+                    r['tilt_deg'], '' if r['round'] == 'ok' else ', round NOT built (%s)'
+                    % r['round']) + ('' if str(r.get('gap', 'ok')).startswith('ok') else
+                                     ', gap NOT applied (%s)' % r.get('gap'))
+        if rep.get('tubes_note'):
+            txt += '\n  ' + rep['tubes_note']
+        if rep.get('holes'):
+            txt += '\n%d holes cut.' % rep['holes']
+        return txt
+    txt = ('Guide base: %s, %d faces, %.0f mm3, in %.0f s.\n'
+           'Contact face: the bone offset %.2f mm, within %.3f mm of it (p99 %.3f) '
+           'inside the outline (%.0f mm long).\n'
+           'Thickness as built %.2f-%.2f mm (asked %.2f); thinner only in hollows '
+           'tighter than the thickness.' % (
+               'solid' if rep.get('solid') else 'NOT solid', rep.get('faces', 0),
+               rep.get('volume_mm3', 0.0), rep.get('secs', 0.0), p['clearance'],
+               f.get('b_dev_max_mm', 0.0), f.get('b_dev_p99_mm', 0.0), f.get('outline_mm', 0.0),
+               f.get('thickness_min_mm', 0.0), f.get('thickness_max_mm', 0.0), p['thickness']))
+    for key, label in (('rim', 'Rim round'), ('contact', 'Contact edge round')):
+        rr = rep.get(key)
+        if rr:
+            txt += ('\n%s %.2f mm: %s' % (label, rr.get('radius_mm', 0.0), 'done' if rr.get('ok')
+                                           else 'NOT built - %s' % rr.get('msg', '')))
+    if f.get('cut_bridged_mm'):
+        txt += ('\nThe outline crosses a groove tighter than the base is tall over %.0f mm; '
+                'there the cut bridges it, at most %.2f mm from the projected outline.'
+                % (f['cut_bridged_mm'], f.get('cut_moved_max_mm', 0.0)))
+    rows = rep.get('tubes') or []
+    if rows:
+        txt += '\n\n%d guide tubes:' % len(rows)
+        for r in rows:
+            if r.get('error'):
+                txt += '\n  %s: %s' % (r['name'], r['error'])
+            else:
+                txt += '\n  %s: %s, axis %.0f deg off the bone normal%s' % (
+                    r['name'], 'pentagon' if r['kind'] == 'pent' else 'cylinder',
+                    r['tilt_deg'], '' if r['round'] == 'ok' else ', round NOT built (%s)'
+                    % r['round']) + ('' if str(r.get('gap', 'ok')).startswith('ok') else
+                                     ', gap NOT applied (%s)' % r.get('gap'))
+        if rep.get('tubes_note'):
+            txt += '\n  ' + rep['tubes_note']
+    if rep.get('holes'):
+        txt += '\n%d holes cut.' % rep['holes']
+    txt += ('\n\nTime: fit %.0f s, assemble %.0f s, cut %.0f s, rim %.0f s.'
+            % (rep.get('engine_s', 0), rep.get('assemble_s', 0), rep.get('cut_s', 0),
+               rep.get('rim_s', 0)))
+    return txt
+
+
 def base_report(p, res):
     txt = ('Guide base: %d triangles, %.0f mm3, footprint %.0f mm2.\n'
            'Contact face %.3f mm from the bone (asked %.2f), base top up to %.2f mm.\n'
@@ -1115,13 +1210,15 @@ def on_created(app, cmd):
         refresh_curve(app, cmd)
     else:
         cmd.setDialogInitialSize(380, 640)
-        b = inputs.addSelectionInput('bone', 'Bone', 'The bone the guide sits on')
+        b = inputs.addSelectionInput('bone', 'Bone', 'The bone the guide sits on: a solid '
+                                     'or Form body (a mesh: convert it first, Mesh to Part)')
         b.addSelectionFilter('SolidBodies')
-        b.addSelectionFilter('MeshBodies')
         b.setSelectionLimits(1, 1)
-        c = inputs.addSelectionInput('curve', 'Outline', 'The closed curve on the bone')
+        c = inputs.addSelectionInput('curve', 'Outline', 'The closed curve - a 3D sketch '
+                                     'on or near the bone; it is projected onto the bone '
+                                     'along the bone\'s normals')
         c.addSelectionFilter('SketchCurves')
-        c.setSelectionLimits(1, 0)
+        c.setSelectionLimits(0, 0)
         h = inputs.addSelectionInput('holes', 'Holes', 'Cylindrical faces or cylinder '
                                      'bodies: a hole is cut along each, at its radius')
         h.addSelectionFilter('CylindricalFaces')
@@ -1140,18 +1237,26 @@ def on_created(app, cmd):
         g = inputs.addGroupCommandInput('guides', 'Guide tubes')
         g.isExpanded = False
         gi = g.children
+        # defaults measured on the hand-made GUIA CORTE of a distal femur case: round
+        # tubes Ø7.0 with a Ø3.5 hole and a 1.5 mm top round; pentagons inscribed
+        # in Ø6.0 with a Ø2.0 hole, their five top edges rounded 1.0, long edges
+        # sharp; tops a median 12.1 / 10.5 mm above the bone along the axis
         for iid, lab, tip in (
-                ('guide_d', 'Outside diameter', 'Cylinder diameter; a pentagon is inscribed '
-                 'in it (5.2 mm: flats 4.21 mm apart).'),
-                ('guide_h', 'Height above the bone', 'From where the axis enters the bone, '
-                 'along the axis, to the top.'),
+                ('guide_d', 'Round: outside diameter', 'Outside diameter of a round tube.'),
+                ('hole_d', 'Round: hole diameter', '0: the picked cylinder\'s own diameter.'),
+                ('guide_h', 'Round: height above the bone', 'From where the axis enters the '
+                 'bone, along the axis, to the top.'),
+                ('guide_top_round', 'Round: top round', 'Round on the top rim.'),
+                ('pent_d', 'Pentagon: outside diameter', 'The circle the pentagon is inscribed '
+                 'in (6.0 mm: flats 4.85 mm apart).'),
+                ('pent_hole_d', 'Pentagon: hole diameter', '0: the picked cylinder\'s own '
+                 'diameter.'),
+                ('pent_h', 'Pentagon: height above the bone', 'From where the axis enters the '
+                 'bone, along the axis, to the top.'),
+                ('pent_top_round', 'Pentagon: top edge round', 'Round on the five top edges; '
+                 'the long edges stay sharp.'),
                 ('guide_clear', 'Gap to the bone', 'The tube\'s bottom stays this far off '
-                 'the bone where it stands out of the base.'),
-                ('hole_d', 'Hole diameter', '0: the picked cylinder\'s own diameter.'),
-                ('guide_top_round', 'Cylinder top round', 'Round on the top rim of a '
-                 'cylindrical guide.'),
-                ('guide_edge_round', 'Pentagon edge round', 'Round on the five long edges '
-                 'of a pentagonal guide; its top is left sharp.')):
+                 'the bone.')):
             vi = gi.addValueInput(iid, lab, 'mm', rl(float(o[iid]) * MM))
             vi.tooltip = tip
         sp = gi.addValueInput('guide_spin', 'Pentagon rotation', 'deg',
@@ -1159,63 +1264,57 @@ def on_created(app, cmd):
         sp.tooltip = ('Turn about the axis. 0: a corner points along the guide\'s length '
                       '(the outline\'s long direction).')
         for iid, lab, tip in (
-                ('clearance', 'Clearance', 'Gap between the bone and the contact face.'),
-                ('thickness', 'Thickness', 'Measured along the bone normal, from the '
-                 'contact face: the top is the bone offset by clearance + thickness.'),
-                ('round', 'Rim round', 'Radius of the round between the top and the '
-                 'wall. A field blend: it cannot fail, and it never touches the '
-                 'contact face.'),
-                ('round_contact', 'Contact edge round', 'Optional round where the wall '
-                 'meets the contact face. 0 keeps the contact face whole.'),
-                ('curve_smooth', 'Outline smoothing', 'Smoothing along the outline '
-                 'before it is laid on the bone (0 = as drawn).')):
+                ('clearance', 'Clearance', 'Gap between the bone and the base: the surface '
+                 'is offset this far off the bone before it is thickened.'),
+                ('thickness', 'Thickness', 'Of the base, from the offset surface outward.'),
+                ('round', 'Rim round', 'Round on the outer (top) rim; 0 for none. It needs '
+                 'room: outline corners clearly wider than the radius.'),
+                ('round_contact', 'Contact edge round', 'Round on the edge at the bone; 0 '
+                 'leaves it sharp.')):
             vi = inputs.addValueInput(iid, lab, 'mm', rl(float(o[iid]) * MM))
             vi.tooltip = tip
-        vx = inputs.addDropDownCommandInput('voxel', 'Resolution',
-                                            adsk.core.DropDownStyles.TextListDropDownStyle)
-        for i, (_k, lab) in enumerate(VOXELS):
-            vx.listItems.add(lab, i == int(o['voxel']))
-        out = inputs.addDropDownCommandInput('output', 'Output',
-                                             adsk.core.DropDownStyles.TextListDropDownStyle)
-        for i, (_k, lab) in enumerate(OUTPUTS):
-            out.listItems.add(lab, i == int(o['output']))
-        out.tooltip = ('Solid: Convert Mesh (faceted, one face per triangle; the only '
-                       'conversion this licence allows), the mesh first reduced to within '
-                       'the facet tolerance. Mesh: the contoured mesh as it is.')
-        ft = inputs.addValueInput('facet_tol', 'Facet tolerance', 'mm',
-                                  rl(float(o['facet_tol']) * MM))
-        ft.tooltip = ('How far the faceted solid may stray from the contoured surface '
-                      '(measured both ways). 0.05 mm gave 65 k faces on a test case with 12 '
-                      'guides.')
-        info = inputs.addTextBoxCommandInput('info', '', 'The wall stands on the bone '
-                                             'along its normal all round the outline, '
-                                             'so side tabs that wrap the bone keep '
-                                             'their thickness.', 4, True)
+        info = inputs.addTextBoxCommandInput('info', '', 'The bone\'s own surface inside '
+                                             'the outline (projected along the bone\'s '
+                                             'normals), offset by the clearance and '
+                                             'thickened; tubes and holes as solid bodies. '
+                                             'No mesh.', 4, True)
         info.isFullWidth = True
 
 
 def base_params(inputs):
-    vx = inputs.itemById('voxel').selectedItem
-    p = {k: inputs.itemById(k).value * CM for k in
-         ('clearance', 'thickness', 'round', 'round_contact', 'curve_smooth')}
-    p['voxel'] = vx.index if vx else 1
-    p['voxel_mm'] = float(VOXELS[p['voxel']][0])
+    p = {k: inputs.itemById(k).value * CM for k in ('clearance', 'thickness', 'round',
+                                                     'round_contact')}
     p.update({k: inputs.itemById(k).value * CM for k in
               ('guide_d', 'guide_h', 'guide_clear', 'hole_d', 'guide_top_round',
-               'guide_edge_round', 'facet_tol')})
+               'pent_d', 'pent_hole_d', 'pent_h', 'pent_top_round')})
     p['guide_spin'] = math.degrees(inputs.itemById('guide_spin').value)
-    out = inputs.itemById('output').selectedItem
-    p['output'] = out.index if out else 1
     return p
 
 
 def picked_tubes(inputs):
-    """(cylinder, kind) for every guide picked; a cylinder picked both ways
-    stays the round one."""
-    tubes = [(c, 'cyl') for c in cylinders(_sel(inputs, 'tubes_cyl'))]
-    tubes += [(c, 'pent') for c in cylinders(_sel(inputs, 'tubes_pent'))
-              if not any(_same_axis(c, t) for t, _k in tubes)]
+    """(cylinder, kind, name, near) for every guide picked - near: the centre
+    of the picked cylindrical face(s), mm, which says which end of the axis the
+    guide is on when there is no outline. A cylinder picked both ways stays the
+    round one."""
+    tubes = []
+    for iid, kind in (('tubes_cyl', 'cyl'), ('tubes_pent', 'pent')):
+        for e in _sel(inputs, iid):
+            name = getattr(e, 'name', '') or getattr(getattr(e, 'body', None), 'name', '')
+            for c in cylinders([e]):
+                if not any(_same_axis(c, t[0]) for t in tubes):
+                    tubes.append((c, kind, name, cylinder_centre(e)))
     return tubes
+
+
+def cylinder_centre(e):
+    """Area centre of the cylindrical face(s) of a picked face or body, mm."""
+    f = adsk.fusion.BRepFace.cast(e)
+    faces = [f] if f else [x for x in adsk.fusion.BRepBody.cast(e).faces
+                           if adsk.core.Cylinder.cast(x.geometry)]
+    if not faces:
+        return None
+    tot = sum(x.area for x in faces)
+    return tuple(sum(_mm(x.centroid)[k] * x.area for x in faces) / tot for k in range(3))
 
 
 def _same_axis(c1, c2):
@@ -1315,10 +1414,8 @@ def start_session(app, cmd):
         inputs.itemById('info').formattedText = '<b>%s</b>' % _esc(
             exc if isinstance(exc, ValueError) else short_error(traceback.format_exc()))
         return
-    # the selection highlight paints the bone and the shapes blue over the
-    # overlay: the session holds them now
-    for iid in ('bone', 'shapes', 'shapes2', 'curve'):
-        inputs.itemById(iid).clearSelection()
+    # the picks stay in their boxes (locked while editing): emptying them read as
+    # the tool dropping the bodies
 
 
 def on_input_changed(app, cmd, iid):
@@ -1367,7 +1464,9 @@ def on_validate(cmd):
     if _cmd_id(cmd) == CMD_CURVE:
         s = state().session
         return bool(s and len(s['fit']) >= 3)
-    return bool(_sel(inputs, 'bone') and _sel(inputs, 'curve'))
+    # a base needs the outline; tubes alone need only the cylinders
+    return bool(_sel(inputs, 'bone') and (_sel(inputs, 'curve') or _sel(inputs, 'tubes_cyl')
+                                          or _sel(inputs, 'tubes_pent')))
 
 
 def on_execute(app, ui, cmd):
@@ -1385,12 +1484,11 @@ def on_execute(app, ui, cmd):
     holes = cylinders(_sel(inputs, 'holes'))
     tubes = picked_tubes(inputs)
     try:
-        body, res = build_base(app, ui, bone, _sel(inputs, 'curve'), holes, p, tubes)
+        body, res = guide_from(app, bone, _sel(inputs, 'curve'), tubes, holes, p)
     except ValueError as exc:
         ui.messageBox(str(exc), CMD_NAMES[CMD_BASE])
         return
-    res['holes'] = len(holes)
-    ui.messageBox(base_report(p, res), CMD_NAMES[CMD_BASE])
+    ui.messageBox(brep_report(p, res), CMD_NAMES[CMD_BASE])
 
 
 def on_destroy(app, cmd):
@@ -2133,7 +2231,388 @@ def dev_shutdown(app, job):
     return {'server': None}
 
 
+def _brep():
+    """bg_brep, re-imported with this module (the hot reload)."""
+    if ADDIN_DIR not in sys.path:
+        sys.path.insert(0, ADDIN_DIR)
+    import bg_brep
+    return importlib.reload(bg_brep)
+
+
+def dev_brep_test(app, job):
+    """Guide Base, BRep, on COPIES: the named bodies (exact BRep copies) and the
+    named sketch's fitted spline are copied out of the active document into a NEW
+    one, the guide is built there and measured, a picture is saved, and the new
+    document is closed unsaved (left open with keep). The active document is
+    only read. Refused unless Fusion is idle."""
+    ui = app.userInterface
+    if ui.activeCommand != 'SelectCommand':
+        return {'refused': 'Fusion is busy (%s)' % ui.activeCommand}
+    src = _design(app)
+    prev = app.activeDocument
+    tbm = adsk.fusion.TemporaryBRepManager.get()
+    names = [job['bone']] + list(job.get('tubes_cyl', [])) + list(job.get('tubes_pent', []))
+    copies = []
+    for n in names:
+        b = _body(app, n)
+        if b is None or not adsk.fusion.BRepBody.cast(b):
+            return {'error': 'no BRep body %r' % n}
+        copies.append(tbm.copy(b))
+    sk = src.rootComponent.sketches.itemByName(job['sketch'])
+    spl = sk.sketchCurves.sketchFittedSplines.item(0)
+    fit = [_v3(spl.fitPoints.item(i).worldGeometry) for i in range(spl.fitPoints.count)]
+    closed = spl.isClosed
+    if closed and len(fit) > 1 and _dist(fit[0], fit[-1]) < 1e-6:
+        fit = fit[:-1]
+    doc = app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
+    out = {'source': prev.name, 'fit_points': len(fit)}
+    try:
+        des = _design(app)
+        if des.designType != adsk.fusion.DesignTypes.ParametricDesignType:
+            des.designType = adsk.fusion.DesignTypes.ParametricDesignType
+        root = des.rootComponent
+        base = root.features.baseFeatures.add()
+        base.startEdit()
+        try:
+            for c in copies:
+                root.bRepBodies.add(c, base)
+        finally:
+            base.finishEdit()
+        bodies = [base.bodies.item(i) for i in range(base.bodies.count)]
+        for b, n in zip(bodies, names):
+            b.name = n
+        sk2 = root.sketches.add(root.xYConstructionPlane)
+        sk2.name = job['sketch']
+        coll = adsk.core.ObjectCollection.create()
+        for q in fit:
+            coll.add(sk2.modelToSketchSpace(adsk.core.Point3D.create(*q)))
+        curve = sk2.sketchCurves.sketchFittedSplines.add(coll)
+        curve.isClosed = closed
+        p = dict(load_settings())
+        p.update(job.get('params', {}))
+        bone = bodies[0]
+        nc = len(job.get('tubes_cyl', []))
+        tubes = []
+        for i, b in enumerate(bodies[1:]):
+            cyl = cylinders([b])
+            if cyl:
+                tubes.append((cyl[0], 'cyl' if i < nc else 'pent', b.name, cylinder_centre(b)))
+        t0 = time.time()
+        guide, rep = guide_from(app, bone, [] if job.get('no_outline') else [curve], tubes,
+                                [], p)
+        out['report'] = rep
+        out['secs'] = round(time.time() - t0, 1)
+        for b in bodies[1:]:
+            b.isLightBulbOn = False
+        if job.get('capture'):
+            if job['capture'].get('hide_bone'):
+                bone.isLightBulbOn = False
+                sk2.isVisible = False
+            bb = guide.boundingBox
+            c = [(getattr(bb.minPoint, k) + getattr(bb.maxPoint, k)) * 0.5 * CM for k in 'xyz']
+            ext = max((getattr(bb.maxPoint, k) - getattr(bb.minPoint, k)) * CM for k in 'xyz')
+            for i, d in enumerate(job['capture'].get('directions', [[1, 1, 1]])):
+                path = job['capture']['path'] % i
+                dev_capture(app, {'target': c, 'direction': d, 'extent': 1.3 * ext,
+                                  'distance': 400.0, 'path': path,
+                                  'up': job['capture'].get('up', (0, 0, 1))})
+            out['captures'] = len(job['capture'].get('directions', [[1, 1, 1]]))
+    except Exception:
+        out['error'] = short_error(traceback.format_exc())
+        log(traceback.format_exc())
+        try:
+            root = _design(app).rootComponent
+            out['bodies'] = []
+            for b in root.bRepBodies:
+                bb = b.boundingBox
+                out['bodies'].append([b.name, b.isSolid, b.faces.count,
+                                      [round(v * CM, 2) for v in (bb.minPoint.x, bb.minPoint.y,
+                                                                  bb.minPoint.z, bb.maxPoint.x,
+                                                                  bb.maxPoint.y, bb.maxPoint.z)],
+                                      round(b.volume * 1000.0, 1) if b.isSolid else None])
+        except Exception:
+            out['bodies_error'] = short_error(traceback.format_exc())
+    finally:
+        if not job.get('keep'):
+            doc.close(False)
+            if prev:
+                prev.activate()
+    return out
+
+
+def dev_probe_split(app, job):
+    """In a scratch (Untitled) document only: distance between the slab and the
+    curtain, and which split call takes them."""
+    doc = app.activeDocument
+    if not doc.name.startswith('Untitled'):
+        return {'refused': doc.name}
+    comp = _design(app).rootComponent
+    slab = comp.bRepBodies.itemByName('Guide base slab')
+    band = comp.bRepBodies.itemByName('Guide base curtain')
+    out = {}
+    try:
+        m = app.measureManager.measureMinimumDistance(slab, band)
+        out['min_distance_mm'] = m.value * CM
+    except Exception:
+        out['distance_error'] = short_error(traceback.format_exc())
+    # where the band crosses the slab's faces, per face
+    tbm = adsk.fusion.TemporaryBRepManager.get()
+    for i, f in enumerate(slab.faces):
+        try:
+            a = tbm.copy(f)
+            b = tbm.copy(band)
+            ok = tbm.booleanOperation(a, b, adsk.fusion.BooleanTypes.IntersectionBooleanType)
+            out.setdefault('face_cross', []).append([i, f.geometry.surfaceType, bool(ok),
+                                                     a.edges.count if a else None])
+        except Exception:
+            out.setdefault('face_cross', []).append([i, 'error', short_error(traceback.format_exc())])
+    for label, tool, ext in (('body', band, False), ('face', band.faces.item(0), False),
+                             ('body_ext', band, True)):
+        try:
+            sin = comp.features.splitBodyFeatures.createInput(slab, tool, ext)
+            sf = comp.features.splitBodyFeatures.add(sin)
+            out[label] = 'ok, %d bodies' % sf.bodies.count
+            sf.deleteMe()
+        except Exception:
+            out[label] = short_error(traceback.format_exc())
+    return out
+
+
+def dev_probe_fillet(app, job):
+    """In a scratch (Untitled) document only: which rim fillets build on the
+    'Guide base' body. Each attempt is undone."""
+    doc = app.activeDocument
+    if not doc.name.startswith('Untitled'):
+        return {'refused': doc.name}
+    comp = _design(app).rootComponent
+    g = comp.bRepBodies.itemByName('Guide base')
+    bone = comp.bRepBodies.item(0)
+    faces = []
+    for f in g.faces:
+        d = app.measureManager.measureMinimumDistance(f, bone).value * CM
+        faces.append((d, f))
+    out = {'faces': [[round(d, 3), f.geometry.surfaceType, f.edges.count,
+                      round(f.area * 100, 1)] for d, f in faces]}
+    out['edges'] = [[round(e.length * CM, 2), e.faces.count] for e in g.edges]
+    top = max(faces, key=lambda t: t[0] if t[1].edges.count < 6 else -1)[1]
+    def attempt(edges, r, chain):
+        coll = adsk.core.ObjectCollection.create()
+        for e in edges:
+            coll.add(e)
+        try:
+            fin = comp.features.filletFeatures.createInput()
+            fin.edgeSetInputs.addConstantRadiusEdgeSet(coll, adsk.core.ValueInput.createByReal(r * MM), chain)
+            f = comp.features.filletFeatures.add(fin)
+            f.deleteMe()
+            return 'ok'
+        except Exception as exc:
+            return str(exc).splitlines()[-1][:90]
+    tedges = [e for e in top.edges]
+    for r in (1.0, 0.5, 0.25):
+        out['rim_r%.2f_chain' % r] = attempt(tedges, r, True)
+    out['per_edge_r1'] = [attempt([e], 1.0, False) for e in tedges]
+    out['per_edge_r0.5'] = [attempt([e], 0.5, False) for e in tedges]
+    return out
+
+
+def dev_probe_rim(app, job):
+    """Scratch (Untitled) documents only: the loops and edges of the Guide base's
+    faces, and which single-edge rounds build. Each attempt is undone."""
+    doc = app.activeDocument
+    if not doc.name.startswith('Untitled'):
+        return {'refused': doc.name}
+    comp = _design(app).rootComponent
+    g = comp.bRepBodies.itemByName('Guide base')
+    out = {'faces': []}
+    for fi, f in enumerate(g.faces):
+        fr = {'i': fi, 'area': round(f.area * 100, 1), 'loops': []}
+        for lp in f.loops:
+            fr['loops'].append({'outer': lp.isOuter,
+                                'edges': [[round(e.length * CM, 3), e.geometry.curveType,
+                                           e.isTolerant, round(e.tolerance * CM, 5)]
+                                          for e in lp.edges]})
+        out['faces'].append(fr)
+
+    def attempt(e, r):
+        coll = adsk.core.ObjectCollection.create()
+        coll.add(e)
+        try:
+            fin = comp.features.filletFeatures.createInput()
+            fin.edgeSetInputs.addConstantRadiusEdgeSet(coll, adsk.core.ValueInput.createByReal(r * MM), False)
+            ft = comp.features.filletFeatures.add(fin)
+            ft.deleteMe()
+            return 'ok'
+        except Exception as exc:
+            return str(exc).splitlines()[-1].strip()[:70]
+    out['edges'] = []
+    for ei, e in enumerate(g.edges):
+        out['edges'].append([ei, round(e.length * CM, 3), [x.tempId for x in e.faces],
+                             attempt(e, 0.2), attempt(e, 2.0) if e.length * CM > 3 else '-'])
+    return out
+
+
+def dev_probe_cyl(app, job):
+    """Scratch (Untitled) documents only: cut 'Guide base slab' with an open
+    cylinder standing through it at job['centre'] (mm) along job['axis'], then
+    try 0.2 and 2 mm rounds on the cut edges."""
+    doc = app.activeDocument
+    if not doc.name.startswith('Untitled'):
+        return {'refused': doc.name}
+    comp = _design(app).rootComponent
+    slab = comp.bRepBodies.itemByName('Guide base slab')
+    tbm = adsk.fusion.TemporaryBRepManager.get()
+    c = [v * MM for v in job['centre']]
+    a = job['axis']
+    r = float(job.get('radius', 12.0)) * MM
+    h = float(job.get('half', 8.0)) * MM
+    cyl = tbm.createCylinderOrCone(adsk.core.Point3D.create(c[0] - a[0] * h, c[1] - a[1] * h, c[2] - a[2] * h), r,
+                                   adsk.core.Point3D.create(c[0] + a[0] * h, c[1] + a[1] * h, c[2] + a[2] * h), r)
+    caps = [f for f in cyl.faces if adsk.core.Plane.cast(f.geometry)]
+    tbm.deleteFaces(caps, False)
+    base = comp.features.baseFeatures.add()
+    base.startEdit()
+    comp.bRepBodies.add(cyl, base)
+    base.finishEdit()
+    tool = base.bodies.item(0)
+    out = {}
+    before = set(b.entityToken for b in comp.bRepBodies)
+    try:
+        sin = comp.features.splitBodyFeatures.createInput(slab, tool, bool(job.get('extended')))
+        sf = comp.features.splitBodyFeatures.add(sin)
+        out['split'] = 'ok'
+    except Exception:
+        out['split'] = short_error(traceback.format_exc())
+        return out
+    pieces = [b for b in comp.bRepBodies if b.isSolid]
+    small = min(pieces, key=lambda b: b.volume)
+    out['piece_volume_mm3'] = round(small.volume * 1000, 1)
+    out['piece_faces'] = [f.geometry.surfaceType for f in small.faces]
+    cut = [e for e in small.edges if any(f.geometry.surfaceType == 1 for f in e.faces)]
+    out['cut_edges'] = len(cut)
+    for rr in (0.2, 2.0):
+        res = []
+        for e in cut:
+            coll = adsk.core.ObjectCollection.create()
+            coll.add(e)
+            try:
+                fin = comp.features.filletFeatures.createInput()
+                fin.edgeSetInputs.addConstantRadiusEdgeSet(coll, adsk.core.ValueInput.createByReal(rr * MM), False)
+                ft = comp.features.filletFeatures.add(fin)
+                ft.deleteMe()
+                res.append('ok')
+            except Exception as exc:
+                res.append(str(exc).splitlines()[-1].strip()[:60])
+        out['r%.1f' % rr] = res
+    return out
+
+
+def dev_probe_thicken(app, job):
+    """Scratch (Untitled) documents only: the slab's contact face alone as a
+    surface, thickened by job['t'] mm away from the bone, then its edges rounded."""
+    doc = app.activeDocument
+    if not doc.name.startswith('Untitled'):
+        return {'refused': doc.name}
+    comp = _design(app).rootComponent
+    slab = comp.bRepBodies.itemByName('Guide base')
+    bone = comp.bRepBodies.item(0)
+    tbm = adsk.fusion.TemporaryBRepManager.get()
+    dist = [(app.measureManager.measureMinimumDistance(f, bone).value, i) for i, f in enumerate(slab.faces)]
+    bi = min(dist)[1]
+    sheet = tbm.copy(slab)
+    tbm.deleteFaces([f for i, f in enumerate(sheet.faces) if i != bi], False)
+    base = comp.features.baseFeatures.add()
+    base.startEdit()
+    comp.bRepBodies.add(sheet, base)
+    base.finishEdit()
+    sb = base.bodies.item(0)
+    out = {'sheet_faces': sb.faces.count}
+    f = sb.faces.item(0)
+    ok, uv = f.evaluator.getParameterAtPoint(f.pointOnFace)
+    ok, n = f.evaluator.getNormalAtParameter(uv)
+    p = f.pointOnFace
+    probe = adsk.core.Point3D.create(p.x + n.x * 0.05, p.y + n.y * 0.05, p.z + n.z * 0.05)
+    away = bone.pointContainment(probe) != adsk.fusion.PointContainment.PointInsidePointContainment
+    t = float(job.get('t', 3.5)) * MM * (1 if away else -1)
+    faces = adsk.core.ObjectCollection.create()
+    faces.add(f)
+    t0 = time.time()
+    try:
+        tin = comp.features.thickenFeatures.createInput(faces, adsk.core.ValueInput.createByReal(t), False,
+                                                         adsk.fusion.FeatureOperations.NewBodyFeatureOperation, False)
+        th = comp.features.thickenFeatures.add(tin)
+        out['thicken'] = 'ok %.1f s' % (time.time() - t0)
+        solid = next(b for b in th.bodies if b.isSolid)
+        out['solid_faces'] = solid.faces.count
+        res = []
+        for e in solid.edges:
+            coll = adsk.core.ObjectCollection.create()
+            coll.add(e)
+            try:
+                fin = comp.features.filletFeatures.createInput()
+                fin.edgeSetInputs.addConstantRadiusEdgeSet(coll, adsk.core.ValueInput.createByReal(0.2), False)
+                ft = comp.features.filletFeatures.add(fin)
+                ft.deleteMe()
+                res.append('ok')
+            except Exception as exc:
+                res.append(str(exc).splitlines()[-1].strip()[:50])
+        out['edge_fillets_2mm'] = res
+    except Exception:
+        out['thicken'] = short_error(traceback.format_exc())
+    return out
+
+
+def dev_probe_chain(app, job):
+    """Scratch (Untitled) documents only: chained rounds on the whole bottom and
+    top loops of 'Guide base' (bottom = the face nearest the bone), each undone."""
+    doc = app.activeDocument
+    if not doc.name.startswith('Untitled'):
+        return {'refused': doc.name}
+    comp = _design(app).rootComponent
+    g = comp.bRepBodies.itemByName('Guide base')
+    bone = comp.bRepBodies.item(0)
+    big = sorted(g.faces, key=lambda f: -f.area)[:3]
+    d = sorted([(app.measureManager.measureMinimumDistance(f, bone).value, i) for i, f in enumerate(big)])
+    bottom, top = big[d[0][1]], big[d[-1][1]]
+
+    def chain(face_fn, r, then=None):
+        f = face_fn()
+        coll = adsk.core.ObjectCollection.create()
+        for e in f.edges:
+            coll.add(e)
+        try:
+            fin = comp.features.filletFeatures.createInput()
+            fin.edgeSetInputs.addConstantRadiusEdgeSet(coll, adsk.core.ValueInput.createByReal(r * MM), True)
+            ft = comp.features.filletFeatures.add(fin)
+        except Exception as exc:
+            return str(exc).splitlines()[-1].strip()[:50]
+        res = 'ok'
+        if then:
+            res += ' + ' + then()
+        ft.deleteMe()
+        return res
+    out = {}
+    for r in job.get('bottom_r', [0.2, 0.3, 0.5, 1.0]):
+        out['bottom %.1f' % r] = chain(lambda: bottom, r)
+    for r in job.get('top_r', [2.0]):
+        out['top %.1f' % r] = chain(lambda: top, r)
+    out['top 2.0 then bottom 0.2'] = chain(lambda: top, 2.0, lambda: chain(
+        lambda: min(comp.bRepBodies.itemByName('Guide base').faces,
+                    key=lambda f: app.measureManager.measureMinimumDistance(f, bone).value), 0.2))
+    return out
+
+
+def _v3(p):
+    return (p.x, p.y, p.z)
+
+
 DEV_COMMANDS = {
+    'brep_test': dev_brep_test,
+    'probe_split': dev_probe_split,
+    'probe_fillet': dev_probe_fillet,
+    'probe_rim': dev_probe_rim,
+    'probe_cyl': dev_probe_cyl,
+    'probe_thicken': dev_probe_thicken,
+    'probe_chain': dev_probe_chain,
     'ping': dev_ping,
     'new_test_doc': dev_new_test_doc,
     'close_doc': dev_close_doc,

@@ -1044,6 +1044,24 @@ def serve():
                 bone = Bone(V, F, step=float(req.get('step', 0.25)))
                 bone.ray(bone.mesh.centroid, (0.0, 0.0, 1.0))   # builds the locator now
                 out = {'triangles': int(len(bone.mesh.faces)), 'samples': int(len(bone.P))}
+            elif op == 'slab':
+                # the guide base as NURBS faces: reads and crops the bone itself,
+                # so no full load of a scan of millions of triangles is needed
+                import bg_slab
+                t0 = time.time()
+                V = np.fromfile(req['coords'], '<f8').reshape(-1, 3)
+                F = np.fromfile(req['tris'], '<i4').reshape(-1, 3)
+                Q = np.asarray(req['pts'], float)
+                pad = float(req.get('margin', 4.0)) + 6.0
+                Vc, Fc = bg_slab.crop(V, F, Q.min(0) - pad, Q.max(0) + pad)
+                b = Bone(Vc, Fc, step=0.25)
+                topo, curtain, keep, rep = bg_slab.slab_cut(
+                    b, Q, float(req['clearance']), float(req['thickness']),
+                    float(req.get('spacing', 3.0)), float(req.get('margin', 4.0)),
+                    rail_spacing=float(req.get('rail_spacing', 1.0)),
+                    rim=float(req.get('rim', 0.0)))
+                rep['secs'] = time.time() - t0
+                out = {'topo': topo, 'curtain': curtain, 'keep': keep, 'report': rep}
             elif bone is None:
                 out = {'error': 'no bone loaded'}
             elif op == 'ray':

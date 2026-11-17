@@ -180,8 +180,9 @@ holes, built from Fusion bodies: one surface, thickened, rounded. No mesh.
 2. **Bone**: select the bone body.
 3. **Outline**: select the closed outline curve(s). Leave it empty to build only
    the guide tubes (each as its own body).
-4. Optional: select cylinders in **Holes**, **Cylindrical guides** and
-   **Pentagonal guides**.
+4. Optional: select cylinders in **Cylindrical guides** and **Pentagonal guides**.
+   Each guide tube gets its own hole, so do not pick its cylinder in **Holes**
+   as well; Holes is for holes with no tube.
 5. If you use guides, open the **Guide tubes** group and check its values.
 6. Set **Clearance**, **Thickness** and the two rounds.
 7. Click **OK** and read the report at the end.
@@ -190,7 +191,7 @@ holes, built from Fusion bodies: one surface, thickened, rounded. No mesh.
 |---|---|---|
 | **Bone** | none | The bone the guide sits on: one solid or Form body. |
 | **Outline** | none | The closed curve on the bone: one or more sketch curves that join. |
-| **Holes** | empty | Cylindrical faces or cylinder bodies. A hole is cut along each, at its own radius. |
+| **Holes** | empty | Cylindrical faces or cylinder bodies. A hole is cut along each, at its own radius. Only for holes without a tube: guide tubes cut their own. |
 | **Cylindrical guides** | empty | Drill or wire cylinders. A round guide tube stands on the bone along each, with the hole through it. |
 | **Pentagonal guides** | empty | Drill or wire cylinders. A pentagonal guide tube along each. A cylinder picked in both boxes becomes a round tube. |
 | **Clearance** | 0.2 mm | Gap between the bone and the base. |
@@ -336,8 +337,14 @@ Two things decide whether the rim round builds, both measured on the test case:
   fails if that vertex sits in a bend: with it in a 2.2 mm bend, every round from
   1.5 to 2.5 mm failed; started on the straightest stretch, every round from 0.5 to
   2.5 mm built. The outline is restarted there, and if the round still fails the base
-  is rebuilt with the outline starting on the next straight stretch (up to three
-  tries; the report says how many were needed).
+  is rebuilt once with the outline starting on the next straight stretch.
+
+If the round still fails, the radius steps down 0.2 mm at a time until Fusion
+builds one (2.0, 1.8, 1.6 ...). The report gives the radius built and the ones
+refused. Tube top rounds step down the same way.
+
+Every body the build makes carries a run tag in its name until the end, so an
+earlier guide in the same component is never picked up by mistake.
 
 Measured on an artificial femur (the bone a Mesh to Part quad-remesh Form, 433 faces):
 three runs: gap to the bone 0.200 mm, overlap 0, rim 2 mm and contact 0.2 mm rounds built

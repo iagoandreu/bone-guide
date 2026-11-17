@@ -124,6 +124,36 @@ def fillet(comp, edges, r_cm, chain=False):
         return False, str(exc).splitlines()[-1][:200]
 
 
+def fillet_down(comp, edges_of, r_mm, chain=True, step=0.2, search=True):
+    """The round at r_mm; if Fusion refuses it, the next smaller one in steps of
+    `step` mm until one builds. (ok, radius built mm, first error, radii failed)."""
+    tried, first = [], ''
+    r = r_mm
+    while r > 0.05:
+        edges = edges_of()
+        if not edges:
+            return False, 0.0, 'edges not found', tried
+        ok, msg = fillet(comp, edges, r * MM, chain)
+        if ok:
+            return True, r, first, tried
+        tried.append(round(r, 2))
+        first = first or msg
+        if not search:
+            break
+        r = round(r - step, 6)
+    return False, 0.0, first, tried
+
+
+def run_tag():
+    """Suffix that keeps this run's bodies apart from an earlier guide's in the
+    same component (their names are how the build finds them again)."""
+    return ' #%06x' % (int(time.time() * 1000) & 0xffffff)
+
+
+def named(comp, name):
+    return next(b for b in comp.bRepBodies if b.name == name)
+
+
 def combine(comp, target, tools, op, keep):
     coll = adsk.core.ObjectCollection.create()
     for t in tools:
@@ -313,15 +343,18 @@ def _build_base_surface(app, srv_ask, bone_paths, curves, p, rep, log, made, bon
 
     # the closed rim edge's one vertex sits where the outline starts; a round
     # can fail where that lands, so a failed rim round is tried again with the
-    # outline starting on another straight stretch
-    starts = r['report'].get('starts') or [0]
-    for attempt, start in enumerate(starts[:3]):
+    # outline starting on another straight stretch, and on that last try a
+    # radius that still fails steps down 0.2 mm at a time until one builds
+    starts = (r['report'].get('starts') or [0])[:2]
+    tag = run_tag()
+    for attempt, start in enumerate(starts):
         mine = []
-        guide = _base_attempt(app, comp, r, curves, p, rep, c, t, bone, start, mine)
+        last = attempt == len(starts) - 1
+        guide = _base_attempt(app, comp, r, curves, p, rep, c, t, bone, start, mine, tag, last)
         made.extend(mine)
         rim_ok = rep.get('rim', {}).get('ok', True)
         rep['attempts'] = attempt + 1
-        if rim_ok or attempt == min(len(starts), 3) - 1:
+        if rim_ok or last:
             break
         for f in reversed(mine):
             try:
@@ -329,16 +362,19 @@ def _build_base_surface(app, srv_ask, bone_paths, curves, p, rep, log, made, bon
             except Exception:
                 pass
             made.remove(f)
+    named(comp, 'Guide base surface' + tag).name = 'Guide base surface'
     rep['faces'] = guide.faces.count
     if adsk.fusion.BRepBody.cast(bone):
         rep['bone_gap'] = body_gap(guide, bone)
     return guide
 
 
-def _base_attempt(app, comp, r, curves, p, rep, c, t, bone, start, made):
-    """Split, thicken, cut and round once, the outline starting at `start`."""
+def _base_attempt(app, comp, r, curves, p, rep, c, t, bone, start, made, tag, search):
+    """Split, thicken, cut and round once, the outline starting at `start`.
+    Bodies carry `tag` in their names while the guide is built."""
     t1 = time.time()
-    (sb,), bf = add_bodies(comp, [surface_body(r)], ['Guide base surface'])
+    SURF, BASE = 'Guide base surface' + tag, 'Guide base' + tag
+    (sb,), bf = add_bodies(comp, [surface_body(r)], [SURF])
     made.append(bf)
     faces = adsk.core.ObjectCollection.create()
     faces.add(sb.faces.item(0))
@@ -366,7 +402,7 @@ def _base_attempt(app, comp, r, curves, p, rep, c, t, bone, start, made):
     sin = comp.features.splitFaceFeatures.createInput(faces, tool, False)
     sin.setClosestPointSplitType()
     made.append(comp.features.splitFaceFeatures.add(sin))
-    sb = next(b for b in comp.bRepBodies if b.name == 'Guide base surface')
+    sb = named(comp, SURF)
     rep['split_faces'] = sb.faces.count
     outer = [f for f in sb.faces if f.loops.count > 1]
     if sb.faces.count != 2 or len(outer) != 1:
@@ -375,7 +411,7 @@ def _base_attempt(app, comp, r, curves, p, rep, c, t, bone, start, made):
     coll = adsk.core.ObjectCollection.create()
     coll.add(outer[0])
     made.append(comp.features.surfaceDeleteFaceFeatures.add(coll))
-    sb = next(b for b in comp.bRepBodies if b.name == 'Guide base surface')
+    sb = named(comp, SURF)
     face = sb.faces.item(0)
     rep['split_s'] = round(time.time() - t1, 1)
 
@@ -424,12 +460,12 @@ def _base_attempt(app, comp, r, curves, p, rep, c, t, bone, start, made):
     # stays t thick
     dip = float(r['report'].get('sunk_max_mm', 0.0)) if c > 0 else 0.0
     rep['clearance_added_mm'] = round(dip, 3)
-    guide = thicken(c + dip + t, 'Guide base')
+    guide = thicken(c + dip + t, BASE)
     if c > 0:
-        inner = thicken(c + dip, 'Guide base clearance')
+        inner = thicken(c + dip, 'Guide base clearance' + tag)
         made.append(combine(comp, guide, [inner],
                             adsk.fusion.FeatureOperations.CutFeatureOperation, False))
-        guide = next(b for b in comp.bRepBodies if b.name == 'Guide base')
+        guide = named(comp, BASE)
     sb.isLightBulbOn = False
     for sk in [m for m in made if adsk.fusion.Sketch.cast(m)]:
         sk.isVisible = False
@@ -474,21 +510,22 @@ def _base_attempt(app, comp, r, curves, p, rep, c, t, bone, start, made):
                 ft.deleteMe()
             except Exception:
                 probe[str(rr_mm)] = False
-            guide = next(b_ for b_ in comp.bRepBodies if b_.name == 'Guide base')
+            guide = named(comp, BASE)
         rep['rim_probe'] = probe
     keys = (('top', 'round', 'rim', c + dip + t), ('bottom', 'round_contact', 'contact', c + dip))
     for key, pkey, label, h in keys:
         rr = float(p.get(pkey, 0.0)) * MM
         if rr <= 0:
             continue
-        f = _face_at(comp, guide, _add(q, nb, h * MM))
-        if f is None:
-            rep[label] = {'ok': False, 'msg': '%s face not found' % key}
-            continue
-        edges = [e for e in f.edges]
-        ok, msg = fillet(comp, edges, rr, True)
-        rep[label] = {'ok': ok, 'msg': msg, 'radius_mm': rr * CM, 'edges': len(edges)}
-        guide = next(b for b in comp.bRepBodies if b.name == 'Guide base')
+        def edges_of():
+            f = _face_at(comp, named(comp, BASE), _add(q, nb, h * MM))
+            return [e for e in f.edges] if f else []
+        n_edges = len(edges_of())
+        ok, built, msg, tried = fillet_down(comp, edges_of, rr * CM, True, 0.2,
+                                            search or key == 'bottom')
+        rep[label] = {'ok': ok, 'msg': msg, 'radius_mm': rr * CM, 'built_mm': built,
+                      'failed_mm': tried, 'edges': n_edges}
+        guide = named(comp, BASE)
     rep['rim_s'] = round(time.time() - t1, 1)
     return guide
 
@@ -761,19 +798,26 @@ def build_tubes(app, comp, srv_ask, bone, guide, tubes, outline_cm, p, rep):
         rep['tubes'] = rows
         return
     pre = set(b.entityToken for b in comp.bRepBodies)
-    bodies, _ = add_bodies(comp, [b['tmp'] for b in built],
-                           ['Guide tube %s' % b['name'] for b in built])
+    # the picked bodies' names can repeat (and an earlier run's tubes may be
+    # there): each tube is found again by a name of its own until the end
+    tag = run_tag()
+    for i, b in enumerate(built):
+        b['body_name'] = 'Guide tube %s%s.%d' % (b['name'], tag, i)
+    bodies, _ = add_bodies(comp, [b['tmp'] for b in built], [b['body_name'] for b in built])
     brep_bone = adsk.fusion.BRepBody.cast(bone) is not None
     for b, body in zip(built, bodies):
         row = {'name': b['name'], 'kind': b['kind'], 'tilt_deg': b['tilt_deg']}
         if b['kind'] == 'pent':
             # the five TOP edges, as on the hand-made guides; the long edges stay sharp
-            re = min(float(p['pent_top_round']) * MM, 0.45 * b['R'])
-            ok, msg = fillet(comp, tube_edges(body, 'pent', b['top'], b['u'], b['R']), re, True)
+            rr = min(float(p['pent_top_round']) * MM, 0.45 * b['R'])
         else:
-            rt = min(float(p['guide_top_round']) * MM, 0.999 * b['R'])
-            ok, msg = fillet(comp, tube_edges(body, 'cyl', b['top'], b['u'], b['R']), rt)
+            rr = min(float(p['guide_top_round']) * MM, 0.999 * b['R'])
+        ok, built_mm, msg, tried = fillet_down(
+            comp, lambda b=b: tube_edges(named(comp, b['body_name']), b['kind'], b['top'],
+                                         b['u'], b['R']), rr * CM, b['kind'] == 'pent')
         row['round'] = 'ok' if ok else msg
+        if ok and tried:
+            row['round_built_mm'] = built_mm
         if brep_bone:
             before = set(x.entityToken for x in comp.bRepBodies)
             combine(comp, body, [bone], adsk.fusion.FeatureOperations.CutFeatureOperation, True)
@@ -782,6 +826,8 @@ def build_tubes(app, comp, srv_ask, bone, guide, tubes, outline_cm, p, rep):
                 row['gap'] = pull_off_bone(comp, bone, b, before, gap)
         rows.append(row)
     tube_bodies = [b for b in comp.bRepBodies if b.isSolid and b.entityToken not in pre]
+    for tb in tube_bodies:
+        tb.name = tb.name.split(tag)[0]
     if tube_bodies and guide is not None:
         combine(comp, guide, tube_bodies, adsk.fusion.FeatureOperations.JoinFeatureOperation,
                 False)
@@ -795,7 +841,7 @@ def build_tubes(app, comp, srv_ask, bone, guide, tubes, outline_cm, p, rep):
 def pull_off_bone(comp, bone, b, before, gap):
     """The faces a tube took from the bone in the cut, moved back gap off it
     (Offset Faces, along their own normal - into the tube)."""
-    bodies = [x for x in comp.bRepBodies if x.isSolid and x.name == 'Guide tube %s' % b['name']]
+    bodies = [x for x in comp.bRepBodies if x.isSolid and x.name == b['body_name']]
     faces = []
     for tb in bodies:
         for f in tb.faces:
@@ -810,7 +856,7 @@ def pull_off_bone(comp, bone, b, before, gap):
         comp.features.offsetFacesFeatures.add(oin)
     except Exception as exc:
         return str(exc).splitlines()[-1].strip()[:120]
-    return 'ok, %d faces, %s' % (len(faces), measured_gap(comp, bone, b['name']))
+    return 'ok, %d faces, %s' % (len(faces), measured_gap(comp, bone, b['body_name']))
 
 
 def measured_gap(comp, bone, name):
@@ -818,7 +864,7 @@ def measured_gap(comp, bone, name):
     app = adsk.core.Application.get()
     tbm = adsk.fusion.TemporaryBRepManager.get()
     out = []
-    for tb in [x for x in comp.bRepBodies if x.isSolid and x.name == 'Guide tube %s' % name]:
+    for tb in [x for x in comp.bRepBodies if x.isSolid and x.name == name]:
         d = app.measureManager.measureMinimumDistance(tb, bone).value * 10.0
         inter = tbm.copy(tb)
         try:

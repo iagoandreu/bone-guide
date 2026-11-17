@@ -1048,12 +1048,20 @@ def brep_report(p, rep):
                 'overlap %.3f mm3.' % (gap['min_mm'], p['clearance'], gap['overlap_mm3']))
     for key, label in (('rim', 'Rim round'), ('contact', 'Contact edge round')):
         rr = rep.get(key)
-        if rr:
-            txt += ('\n%s %.2f mm: %s' % (label, rr.get('radius_mm', 0.0), 'done' if rr.get('ok')
-                                           else 'NOT built - %s' % rr.get('msg', '').strip()))
+        if not rr:
+            continue
+        failed = ', '.join('%.1f' % x for x in rr.get('failed_mm') or [])
+        if rr.get('ok') and failed:
+            txt += ('\n%s %.2f mm: built at %.2f mm (Fusion refused %s mm).'
+                    % (label, rr['radius_mm'], rr['built_mm'], failed))
+        elif rr.get('ok'):
+            txt += '\n%s %.2f mm: done' % (label, rr['radius_mm'])
+        else:
+            txt += ('\n%s %.2f mm: NOT built (tried %s mm) - %s'
+                    % (label, rr.get('radius_mm', 0.0), failed, rr.get('msg', '').strip()))
     if rep.get('attempts', 1) > 1:
-        txt += ('\nThe rim round needed %d tries (the outline restarted on another straight '
-                'stretch each time).' % rep['attempts'])
+        txt += ('\nThe rim round was tried again with the outline starting on another '
+                'straight stretch.')
     if f.get('open_radius_mm'):
         txt += ('\nConvex bends of the outline tighter than %.2f mm (tightest %.2f) were opened '
                 'for the rim round: the outline moved %.2f mm at most there.'
@@ -1068,8 +1076,9 @@ def brep_report(p, rep):
             else:
                 txt += '\n  %s: %s, axis %.0f deg off the bone normal%s' % (
                     r['name'], 'pentagon' if r['kind'] == 'pent' else 'cylinder',
-                    r['tilt_deg'], '' if r['round'] == 'ok' else ', round NOT built (%s)'
-                    % r['round']) + (
+                    r['tilt_deg'], ('' if 'round_built_mm' not in r else ', top round %.1f mm'
+                                    % r['round_built_mm']) if r['round'] == 'ok'
+                    else ', round NOT built (%s)' % r['round']) + (
                     (', ' + str(r['gap']).split(', ', 2)[-1]) if str(r.get('gap', 'ok')).startswith('ok')
                     else ', gap NOT applied (%s)' % r.get('gap'))
         if rep.get('tubes_note'):
@@ -1226,8 +1235,9 @@ def on_created(app, cmd):
                                      'along the bone\'s normals')
         c.addSelectionFilter('SketchCurves')
         c.setSelectionLimits(0, 0)
-        h = inputs.addSelectionInput('holes', 'Holes', 'Cylindrical faces or cylinder '
-                                     'bodies: a hole is cut along each, at its radius')
+        h = inputs.addSelectionInput('holes', 'Holes', 'Holes with no guide tube: cylindrical '
+                                     'faces or cylinder bodies, a hole along each at its '
+                                     'radius. The guides below cut their own holes.')
         h.addSelectionFilter('CylindricalFaces')
         h.addSelectionFilter('SolidBodies')
         h.setSelectionLimits(0, 0)
@@ -2689,7 +2699,154 @@ def _v3(p):
     return (p.x, p.y, p.z)
 
 
+def dev_inventory(app, job):
+    """Read-only: occurrences, bodies (with their cylindrical faces) and sketches
+    of the active design."""
+    des = _design(app)
+    root = des.rootComponent
+    out = {'doc': app.activeDocument.name, 'active_comp': des.activeComponent.name,
+           'root_bodies': [], 'occurrences': [], 'sketches': []}
+
+    def row(b):
+        n = b.faces.count
+        cyl = sum(1 for f in b.faces if adsk.core.Cylinder.cast(f.geometry)) if n <= 300 else None
+        return [b.name, b.isSolid, n, cyl, b.isLightBulbOn]
+    if job.get('resolve'):
+        out = {}
+        for n in job['resolve']:
+            out[n] = [[type(e).__name__, getattr(e, 'name', '')] for e in _live_entities(app, n)]
+        tl = des.timeline
+        out['groups'] = [tl.timelineGroups.item(g).name for g in range(tl.timelineGroups.count)]
+        return out
+    if job.get('sets_only'):
+        out = {'sets': []}
+        for i in range(des.selectionSets.count):
+            ss = des.selectionSets.item(i)
+            ents = ss.entities
+            out['sets'].append({'name': ss.name, 'entities': [
+                [type(e).__name__, getattr(e, 'name', '') or getattr(getattr(e, 'body', None), 'name', '')]
+                for e in ents]})
+        return out
+    out['root_bodies'] = [row(b) for b in root.bRepBodies]
+    out['root_meshes'] = [m.name for m in root.meshBodies]
+    for occ in root.allOccurrences:
+        out['occurrences'].append({'occ': occ.fullPathName, 'comp': occ.component.name,
+                                   'identity': occ.transform2.isEqualTo(adsk.core.Matrix3D.create()),
+                                   'bodies': [row(b) for b in occ.bRepBodies]})
+    for comp in des.allComponents:
+        for sk in comp.sketches:
+            cs = sk.sketchCurves
+            out['sketches'].append({'comp': comp.name, 'name': sk.name, 'curves': cs.count,
+                                    'fitted': cs.sketchFittedSplines.count,
+                                    'closed': [s.isClosed for s in cs.sketchFittedSplines],
+                                    'visible': sk.isVisible})
+    return out
+
+
+def dev_cyl_near(app, job):
+    """Read-only: every visible body with exactly one cylinder axis (cylinders(),
+    small bodies only): its radius, axis, and how close the axis passes to the
+    sketch outline (min distance, mm) and to the outline's centre."""
+    des = _design(app)
+    sk = des.rootComponent.sketches.itemByName(job['sketch'])
+    pts = []
+    for c in sk.sketchCurves:
+        pts += curve_polyline(c, 0.5)
+    cen = tuple(sum(p[k] for p in pts) / len(pts) for k in range(3))
+    out = {'centre': cen, 'bodies': []}
+    for b in des.rootComponent.bRepBodies:
+        if not b.isLightBulbOn or b.faces.count > 40:
+            continue
+        cyl = cylinders([b])
+        if len(cyl) != 1:
+            continue
+        o, a, r = cyl[0]
+
+        def d(p):
+            q = _sub(p, o)
+            t = sum(q[k] * a[k] for k in range(3))
+            return _dist(q, tuple(t * a[k] for k in range(3)))
+        out['bodies'].append({'name': b.name, 'r': round(r, 3), 'faces': b.faces.count,
+                              'to_outline': round(min(d(p) for p in pts[::4]), 1),
+                              'to_centre': round(d(cen), 1),
+                              'centre': [round(x, 1) for x in _mm(b.boundingBox.minPoint)]})
+    return out
+
+
+def _timeline_features(des, name):
+    """The features of the timeline item (or group) called `name`, else None."""
+    tl = des.timeline
+    for g in range(tl.timelineGroups.count):
+        grp = tl.timelineGroups.item(g)
+        if grp.name == name:
+            return [grp.item(i).entity for i in range(grp.count)
+                    if hasattr(grp.item(i).entity, 'bodies')]
+    for i in range(tl.count):
+        it = tl.item(i)
+        if it.name == name and hasattr(it.entity, 'bodies'):
+            return [it.entity]
+    return None
+
+
+def _live_entities(app, name):
+    """Bodies of an occurrence/component called `name` (as proxies), or the
+    body(ies) called `name`, or the entities of the selection set `name`."""
+    des = _design(app)
+    root = des.rootComponent
+    try:
+        ss = des.selectionSets.itemByName(name)
+    except Exception:
+        ss = None
+    if ss:
+        return [ss.entities[i] for i in range(len(ss.entities))]
+    feats = _timeline_features(des, name)
+    if feats is not None:
+        out = []
+        for f in feats:
+            out += [f.bodies.item(i) for i in range(f.bodies.count)]
+        return out
+    for occ in root.allOccurrences:
+        if occ.component.name == name or occ.name.split(':')[0] == name:
+            return [b for b in occ.bRepBodies]
+    hits = [b for b in root.bRepBodies if b.name == name]
+    for occ in root.allOccurrences:
+        hits += [b for b in occ.bRepBodies if b.name == name]
+    return hits
+
+
+def dev_guide_live(app, job):
+    """Guide Base in the ACTIVE document, as the dialog would run it: bone,
+    sketch curves, cylindrical / pentagonal guides and holes picked by name
+    (a component name takes all its bodies). Returns the report and text."""
+    ui = app.userInterface
+    if ui.activeCommand != 'SelectCommand':
+        return {'refused': 'Fusion is busy (%s)' % ui.activeCommand}
+    bone = _live_entities(app, job['bone'])[0]
+    sk = None
+    for comp in _design(app).allComponents:
+        sk = sk or comp.sketches.itemByName(job['sketch'])
+    curves = [sk.sketchCurves.item(i) for i in range(sk.sketchCurves.count)]
+    p = dict(load_settings())
+    p.update(job.get('params', {}))
+    tubes = []
+    for key, kind in (('tubes_cyl', 'cyl'), ('tubes_pent', 'pent')):
+        for n in job.get(key, []):
+            for e in _live_entities(app, n):
+                for c in cylinders([e]):
+                    if not any(_same_axis(c, t[0]) for t in tubes):
+                        tubes.append((c, kind, e.name, cylinder_centre(e)))
+    holes = cylinders([e for n in job.get('holes', []) for e in _live_entities(app, n)])
+    t0 = time.time()
+    body, rep = guide_from(app, bone, curves, tubes, holes, p)
+    return {'secs': round(time.time() - t0, 1), 'tubes': len(tubes), 'curves': len(curves),
+            'text': brep_report(p, rep),
+            'report': {k: v for k, v in rep.items() if k != 'fit'}}
+
+
 DEV_COMMANDS = {
+    'inventory': dev_inventory,
+    'cyl_near': dev_cyl_near,
+    'guide_live': dev_guide_live,
     'brep_test': dev_brep_test,
     'probe_split': dev_probe_split,
     'probe_fillet': dev_probe_fillet,

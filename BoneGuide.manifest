@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "addin",
+    "id": "cb0ad7a8-b1bd-4493-81dd-4d51ddf87477",
+    "author": "Iago Andreu",
+    "description": {
+        "": "Patient-specific guide on a bone: edit a closed curve over the bone, then grow the guide base inside it - thickness along the bone normal, rim round that cannot fail."
+    },
+    "version": "0.3.0",
+    "runOnStartup": true,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}

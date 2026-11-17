@@ -25,10 +25,9 @@ two panels:
 
 Fusion's own Python has no numpy, so the geometry runs in a separate Python 3
 process. It needs **numpy**, **scipy**, **trimesh** and **pyvista**
-(`pip install numpy scipy trimesh pyvista`). Guide Base with **Output** set to
-**Solid body (faceted)** and a **Facet tolerance** above 0 (the defaults) also
-needs **pymeshlab** (`pip install pymeshlab`). The add-in does not check for
-pymeshlab in advance; without it that build fails at the reduction step.
+(`pip install numpy scipy trimesh pyvista`). Guide Base also uses **contourpy**
+and **matplotlib** to open the outline's tight bends
+(`pip install contourpy matplotlib`).
 
 The add-in uses the first interpreter that can `import numpy, scipy, trimesh, pyvista`,
 tried in this order:
@@ -204,12 +203,13 @@ femur cutting guide:
 
 | Input | Default | What it does |
 |---|---|---|
+| **Hole = the cylinder's diameter** | on | Each tube's hole, and the hole through the base along it, has the diameter of the cylinder picked for that tube (a Ø4.3 drill cylinder gives a Ø4.3 hole). Off: the two hole diameters below. |
 | **Round: outside diameter** | 7.0 mm | Round tube diameter. |
-| **Round: hole diameter** | 3.5 mm | 0: the picked cylinder's own diameter. |
+| **Round: hole diameter** | 3.5 mm | Shown only when the hole is not the cylinder's diameter. |
 | **Round: height above the bone** | 12.1 mm | From where the axis enters the bone, along the axis, to the top. |
 | **Round: top round** | 1.5 mm | Round on the top rim. |
 | **Pentagon: outside diameter** | 6.0 mm | Circle the pentagon is inscribed in (flats 4.85 mm apart). |
-| **Pentagon: hole diameter** | 2.0 mm | 0: the picked cylinder's own diameter. |
+| **Pentagon: hole diameter** | 2.0 mm | Shown only when the hole is not the cylinder's diameter. |
 | **Pentagon: height above the bone** | 10.5 mm | As for round tubes. |
 | **Pentagon: top edge round** | 1.0 mm | Round on the five top edges; the long edges stay sharp. |
 | **Gap to the bone** | 0.2 mm | The tube's bottom stays this far off the bone. |
@@ -235,12 +235,14 @@ Without an outline: one **Guide tube <name>** body per guide.
 
 The report gives the measured **gap between the base and the bone** and their
 **overlap** (should be 0), and the same for every tube; whether each round was
-built; the bends that were opened in the outline and by how much it moved; and the
-time. Before you trust the part, check:
+built, and at what radius if Fusion refused the one asked; the bends that were opened
+in the outline and by how much it moved; the hole diameters cut; and the time.
+Before you trust the part, check:
 
 - the base gap is at least the clearance and the overlap is 0;
+- the rim round is the radius you asked for, or one you accept;
 - every tube shows its round and the gap you asked for;
-- the narrowest hole is the drill or wire size you need;
+- the hole diameters are the drill or wire sizes you need;
 - the base in the viewport, especially side tabs that wrap the bone.
 
 Errors appear in a message box. Details go to `BoneGuide.log` in the add-in folder.
@@ -349,7 +351,10 @@ earlier guide in the same component is never picked up by mistake.
 Measured on an artificial femur (the bone a Mesh to Part quad-remesh Form, 433 faces):
 three runs: gap to the bone 0.200 mm, overlap 0, rim 2 mm and contact 0.2 mm rounds built
 at the first try every time, 12 tubes each 0.200 mm off the bone, 94 - 96 s in all
-(fit 17 s, split 11 s, thicken 5 s, rounds 27 s, tubes 18 s).
+(fit 17 s, split 11 s, thicken 5 s, rounds 27 s, tubes 18 s). The same bone in the
+design case itself, with an edited outline, 9 mm round / 7.5 mm pentagonal tubes 15 /
+10.5 mm high, thickness 4 mm: rim 2 mm and contact 0.2 mm at the first try, gap 0.200
+mm, 12 tubes 0.200 mm, 100 s.
 
 ## Install
 

@@ -911,7 +911,9 @@ def build_guide(app, bone, curves, tubes, holes, p, srv_ask, bone_paths, log=Non
             org, axis, r = c[:3]
             kind = c[3] if len(c) > 3 else None
             key = {'cyl': 'hole_d', 'pent': 'pent_hole_d'}.get(kind)
-            rr = 0.5 * float(p[key]) * MM if key and float(p.get(key, 0)) > 0 else r
+            own = p.get('hole_from_cyl', True)
+            rr = 0.5 * float(p[key]) * MM if key and not own and float(p.get(key, 0)) > 0 else r
+            rep.setdefault('hole_d_mm', set()).add(round(2 * rr * CM, 2))
             a = _unit(axis)
             tmps.append(tbm.createCylinderOrCone(_pt(_add(org, a, -100.0)), rr,
                                                  _pt(_add(org, a, 100.0)), rr))
@@ -924,6 +926,7 @@ def build_guide(app, bone, curves, tubes, holes, p, srv_ask, bone_paths, log=Non
                 combine(comp, tb, hb, adsk.fusion.FeatureOperations.CutFeatureOperation, True)
             remove(comp, hb)
     rep['holes'] = len(cut)
+    rep['hole_d_mm'] = sorted(rep.get('hole_d_mm', ()))
     rep['holes_s'] = round(time.time() - t1, 1)
     if guide is None:
         bodies = rep.pop('tube_bodies', [])

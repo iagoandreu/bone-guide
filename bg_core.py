@@ -65,6 +65,7 @@ DEFAULTS = {'influence': 0.0, 'smooth_mm': 1.0, 'clearance': 0.2, 'thickness': 3
             'closing_mode': 0, 'join': True,
             'guide_d': 7.0, 'guide_h': 12.1, 'guide_clear': 0.2, 'guide_top_round': 1.5,
             'guide_edge_round': 0.0, 'guide_spin': 0.0, 'hole_d': 3.5, 'output': 1,
+            'hole_from_cyl': True,
             'pent_d': 6.0, 'pent_hole_d': 2.0, 'pent_h': 10.5, 'pent_top_round': 1.0,
             'facet_tol': 0.05}
 # the drill guides of a distal radius test case, measured: hole = the reference
@@ -930,7 +931,8 @@ def base_job(bone, curves, holes, p, tubes=()):
            'smooth': p['curve_smooth'], 'out_stl': os.path.join(WORK, 'base.stl'),
            'holes': [{'origin': o, 'axis': a, 'radius': r} for o, a, r in holes],
            'tubes': [{'origin': o, 'axis': a, 'kind': kind,
-                      'radius': p['hole_d'] / 2.0 if p['hole_d'] > 0 else r,
+                      'radius': p['hole_d'] / 2.0 if p['hole_d'] > 0 and
+                      not p.get('hole_from_cyl', True) else r,
                       'R': p['guide_d'] / 2.0, 'height': p['guide_h'],
                       'clear': p['guide_clear'],
                       'top_round': p['guide_top_round'] if kind == 'cyl' else 0.0,
@@ -1033,7 +1035,8 @@ def brep_report(p, rep):
         if rep.get('tubes_note'):
             txt += '\n  ' + rep['tubes_note']
         if rep.get('holes'):
-            txt += '\n%d holes cut.' % rep['holes']
+            txt += '\n%d holes cut, diameter %s mm.' % (
+                rep['holes'], ' / '.join('%.2f' % d for d in rep.get('hole_d_mm', [])))
         return txt
     gap = rep.get('bone_gap') or {}
     txt = ('Guide base: %s, %d faces, %.0f mm3, in %.0f s.\n'
@@ -1084,7 +1087,8 @@ def brep_report(p, rep):
         if rep.get('tubes_note'):
             txt += '\n  ' + rep['tubes_note']
     if rep.get('holes'):
-        txt += '\n%d holes cut.' % rep['holes']
+        txt += '\n%d holes cut, diameter %s mm.' % (
+                rep['holes'], ' / '.join('%.2f' % d for d in rep.get('hole_d_mm', [])))
     txt += ('\n\nTime: fit %.0f s, split %.0f s, thicken %.0f s, rounds %.0f s, tubes %.0f s.'
             % (rep.get('engine_s', 0), rep.get('split_s', 0), rep.get('thicken_s', 0),
                rep.get('rim_s', 0), rep.get('tubes_s', 0)))
@@ -1254,20 +1258,25 @@ def on_created(app, cmd):
         g = inputs.addGroupCommandInput('guides', 'Guide tubes')
         g.isExpanded = False
         gi = g.children
+        hf = gi.addBoolValueInput('hole_from_cyl', 'Hole = the cylinder\'s diameter', True, '',
+                                  bool(o['hole_from_cyl']))
+        hf.tooltip = ('On: each tube\'s hole, and the hole through the base, has the diameter '
+                      'of the cylinder picked for it. Off: the two hole diameters below.')
         # defaults measured on the hand-made GUIA CORTE of a distal femur case: round
         # tubes Ø7.0 with a Ø3.5 hole and a 1.5 mm top round; pentagons inscribed
         # in Ø6.0 with a Ø2.0 hole, their five top edges rounded 1.0, long edges
         # sharp; tops a median 12.1 / 10.5 mm above the bone along the axis
         for iid, lab, tip in (
                 ('guide_d', 'Round: outside diameter', 'Outside diameter of a round tube.'),
-                ('hole_d', 'Round: hole diameter', '0: the picked cylinder\'s own diameter.'),
+                ('hole_d', 'Round: hole diameter', 'Used when "Hole = the cylinder\'s '
+                 'diameter" is off.'),
                 ('guide_h', 'Round: height above the bone', 'From where the axis enters the '
                  'bone, along the axis, to the top.'),
                 ('guide_top_round', 'Round: top round', 'Round on the top rim.'),
                 ('pent_d', 'Pentagon: outside diameter', 'The circle the pentagon is inscribed '
                  'in (6.0 mm: flats 4.85 mm apart).'),
-                ('pent_hole_d', 'Pentagon: hole diameter', '0: the picked cylinder\'s own '
-                 'diameter.'),
+                ('pent_hole_d', 'Pentagon: hole diameter', 'Used when "Hole = the '
+                 'cylinder\'s diameter" is off.'),
                 ('pent_h', 'Pentagon: height above the bone', 'From where the axis enters the '
                  'bone, along the axis, to the top.'),
                 ('pent_top_round', 'Pentagon: top edge round', 'Round on the five top edges; '
@@ -1276,6 +1285,7 @@ def on_created(app, cmd):
                  'the bone.')):
             vi = gi.addValueInput(iid, lab, 'mm', rl(float(o[iid]) * MM))
             vi.tooltip = tip
+            vi.isVisible = not (iid in ('hole_d', 'pent_hole_d') and o['hole_from_cyl'])
         sp = gi.addValueInput('guide_spin', 'Pentagon rotation', 'deg',
                               rl(math.radians(float(o['guide_spin']))))
         sp.tooltip = ('Turn about the axis. 0: a corner points along the guide\'s length '
@@ -1305,6 +1315,7 @@ def base_params(inputs):
               ('guide_d', 'guide_h', 'guide_clear', 'hole_d', 'guide_top_round',
                'pent_d', 'pent_hole_d', 'pent_h', 'pent_top_round')})
     p['guide_spin'] = math.degrees(inputs.itemById('guide_spin').value)
+    p['hole_from_cyl'] = bool(inputs.itemById('hole_from_cyl').value)
     return p
 
 
@@ -1439,6 +1450,10 @@ def on_input_changed(app, cmd, iid):
     cid = _cmd_id(cmd)
     inputs = cmd.commandInputs
     if cid != CMD_CURVE:
+        if iid == 'hole_from_cyl':
+            own = inputs.itemById('hole_from_cyl').value
+            for k in ('hole_d', 'pent_hole_d'):
+                inputs.itemById(k).isVisible = not own
         return
     st = state()
     if iid in ('bone', 'shapes', 'shapes2', 'curve'):

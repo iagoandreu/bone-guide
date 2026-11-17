@@ -159,123 +159,105 @@ turns into the bone-contacting base.
 
 ### Guide Base
 
-The guide base inside a closed curve on the bone, optionally with guide tubes and
-holes, built as one mesh and optionally converted to a faceted solid.
+The guide base inside a closed outline on the bone, with optional guide tubes and
+holes, built from Fusion bodies: one surface, thickened, rounded. No mesh.
 
 #### Before you start
 
-- **The bone**: a solid body or a mesh body.
+- **The bone as a solid or Form body.** A scan is a mesh: convert it first with
+  Mesh to Part, **Organic Form (quad remesh)** (about 20 s for a femur). The tubes are
+  trimmed against this body and the gaps are measured against it, so use the same
+  bone body you will check the guide against.
 - **A closed outline on the bone**: one or several sketch curves that join end to
   end, for example the result of Bone Curve.
 - Optional: **cylinders** for holes and guide tubes - cylindrical faces, or solid
   bodies (every cylindrical face of a picked body is used).
-- The external Python (see above), with pymeshlab for the default solid output.
+- The external Python (see above).
 
 #### Step by step
 
 1. Click **Guide Base**.
-2. **Bone**: select the bone.
-3. **Outline**: select the closed outline curve(s).
+2. **Bone**: select the bone body.
+3. **Outline**: select the closed outline curve(s). Leave it empty to build only
+   the guide tubes (each as its own body).
 4. Optional: select cylinders in **Holes**, **Cylindrical guides** and
    **Pentagonal guides**.
 5. If you use guides, open the **Guide tubes** group and check its values.
-6. Set **Clearance**, **Thickness**, the rounds, **Resolution** and **Output**.
-7. Click **OK**. A progress dialog shows the engine's current step and the
-   elapsed time; you can cancel it. A build takes from tens of seconds to a few
-   minutes, depending on size and resolution.
-8. Read the report in the message box at the end.
+6. Set **Clearance**, **Thickness** and the two rounds.
+7. Click **OK** and read the report at the end.
 
 | Input | Default | What it does |
 |---|---|---|
-| **Bone** | none | The bone the guide sits on. One solid or mesh body. |
+| **Bone** | none | The bone the guide sits on: one solid or Form body. |
 | **Outline** | none | The closed curve on the bone: one or more sketch curves that join. |
 | **Holes** | empty | Cylindrical faces or cylinder bodies. A hole is cut along each, at its own radius. |
-| **Cylindrical guides** | empty | Drill or wire cylinders (faces or bodies). A round guide tube stands on the bone along each, with the hole through it. |
-| **Pentagonal guides** | empty | Drill or wire cylinders. A pentagonal guide tube along each, with the hole through it. A cylinder picked in both boxes becomes a round tube. |
-| **Clearance** | 0.2 mm | Gap between the bone and the contact face. |
-| **Thickness** | 3.5 mm | Measured along the bone normal from the contact face: the top is the bone offset by clearance + thickness. |
-| **Rim round** | 1 mm | Radius of the round between the top and the wall. A field blend: it cannot fail and never touches the contact face. |
-| **Contact edge round** | 0 mm | Optional round where the wall meets the contact face. 0 keeps the contact face whole. |
-| **Outline smoothing** | 0.5 mm | Smoothing along the outline before it is laid on the bone. 0 = as drawn. |
-| **Resolution** | Medium - 0.15 mm voxels | **Fine - 0.10 mm voxels**, **Medium - 0.15 mm voxels** or **Draft - 0.25 mm voxels**. Finer is truer and slower. |
-| **Output** | Solid body (faceted) | **Mesh body**: the contoured mesh as it is. **Solid body (faceted)**: the mesh is first reduced to within the facet tolerance, then converted with Convert Mesh (faceted, one face per triangle). |
-| **Facet tolerance** | 0.05 mm | For the solid output: how far the reduced mesh may stray from the contoured surface, measured both ways. 0 skips the reduction. |
+| **Cylindrical guides** | empty | Drill or wire cylinders. A round guide tube stands on the bone along each, with the hole through it. |
+| **Pentagonal guides** | empty | Drill or wire cylinders. A pentagonal guide tube along each. A cylinder picked in both boxes becomes a round tube. |
+| **Clearance** | 0.2 mm | Gap between the bone and the base. |
+| **Thickness** | 3.5 mm | Of the base, from the clearance outward (the top is clearance + thickness off the bone). |
+| **Rim round** | 2 mm | Round on the top rim. |
+| **Contact edge round** | 0.2 mm | Round on the rim at the bone. |
 
-**Guide tubes** group (collapsed):
+**Guide tubes** group (collapsed). The defaults were measured on a hand-made distal
+femur cutting guide:
 
 | Input | Default | What it does |
 |---|---|---|
-| **Outside diameter** | 5.2 mm | Tube diameter. A pentagonal tube is inscribed in it (5.2 mm: flats 4.21 mm apart). |
-| **Height above the bone** | 10 mm | From where the axis enters the bone, along the axis, to the top. |
-| **Gap to the bone** | 0.5 mm | The tube's bottom stays this far off the bone where it stands out of the base. |
-| **Hole diameter** | 0 mm | 0: the picked cylinder's own diameter. |
-| **Cylinder top round** | 1 mm | Round on the top rim of a cylindrical tube. |
-| **Pentagon edge round** | 1 mm | Round on the five long edges of a pentagonal tube; its top is left sharp. |
-| **Pentagon rotation** | 0 deg | Turn of the pentagon about its axis. 0: a corner points along the guide's length (the outline's long direction). |
+| **Round: outside diameter** | 7.0 mm | Round tube diameter. |
+| **Round: hole diameter** | 3.5 mm | 0: the picked cylinder's own diameter. |
+| **Round: height above the bone** | 12.1 mm | From where the axis enters the bone, along the axis, to the top. |
+| **Round: top round** | 1.5 mm | Round on the top rim. |
+| **Pentagon: outside diameter** | 6.0 mm | Circle the pentagon is inscribed in (flats 4.85 mm apart). |
+| **Pentagon: hole diameter** | 2.0 mm | 0: the picked cylinder's own diameter. |
+| **Pentagon: height above the bone** | 10.5 mm | As for round tubes. |
+| **Pentagon: top edge round** | 1.0 mm | Round on the five top edges; the long edges stay sharp. |
+| **Gap to the bone** | 0.2 mm | The tube's bottom stays this far off the bone. |
+| **Pentagon rotation** | 0 deg | Turn about the axis. 0: a corner points along the outline's long direction. |
 
 The values are remembered for the next time (`last_settings.json` in the add-in
 folder).
 
 #### What you get
 
-All in the **root component**:
+In the active component:
 
-- a mesh body named `Guide base t<thickness> c<clearance> r<rim round>`, for
-  example `Guide base t3.50 c0.20 r1.00`. In a parametric design it sits in a base
-  feature of the same name;
-- with **Solid body (faceted)**: a Convert Mesh feature and a solid body with the
-  same name; the mesh body is hidden.
+- **Guide base**: one solid - base, tubes and holes - built by Fusion features
+  (base feature, split face, delete face, two thickens, combine, fillets, tubes,
+  combines), all in the timeline;
+- **Guide base surface** (hidden): the single surface the base was thickened from;
+- **Guide base outline (eased)** (hidden sketch): the outline the base was cut
+  with (see below). Your outline sketch is not changed.
 
-The base, the tubes and the holes are one body. The bone, the outline and the
-cylinders are not changed. The parameters and results are stored as attributes on
-the body (attribute group `BoneGuide`).
+Without an outline: one **Guide tube <name>** body per guide.
 
 #### Checking the result
 
-The message box at the end reports:
+The report gives the measured **gap between the base and the bone** and their
+**overlap** (should be 0), and the same for every tube; whether each round was
+built; the bends that were opened in the outline and by how much it moved; and the
+time. Before you trust the part, check:
 
-- triangles, volume (mm3) and footprint (mm2);
-- the contact face's median distance from the bone, against the clearance asked,
-  and the highest point of the top;
-- the outline length, the number of holes and the time;
-- with guides: their number by type, the narrowest hole diameter, the range of
-  tube top heights above the bone, and the smallest tube-to-bone gap against the
-  gap asked;
-- loose specks left out (pieces not connected to the main body), with their total
-  volume and largest size;
-- with the solid output: triangles before and after the reduction, the measured
-  deviation against the facet tolerance, and the number of faces.
+- the base gap is at least the clearance and the overlap is 0;
+- every tube shows its round and the gap you asked for;
+- the narrowest hole is the drill or wire size you need;
+- the base in the viewport, especially side tabs that wrap the bone.
 
-Before you trust the part, check:
-
-- the contact distance equals the clearance you asked for;
-- the narrowest hole diameter is the drill or wire size you need;
-- the tube-to-bone gap is not smaller than asked;
-- the loose specks: a large one means part of the design came out disconnected
-  and was dropped;
-- the base in the viewport, especially side tabs that wrap the bone, and the
-  rounds.
-
-Errors appear in a message box (for example "The outline must be closed",
-"nothing lies inside the curve", "a guide axis does not meet the bone"). Details go
-to `BoneGuide.log` in the add-in folder.
+Errors appear in a message box. Details go to `BoneGuide.log` in the add-in folder.
 
 #### Where it fits
 
 Use it after Bone Curve (or any closed outline on the bone), once the drill or
-screw trajectories exist as cylinders. It produces the guide body - base, tubes and
-holes - ready for a final check and STL export for printing.
+screw trajectories exist as cylinders. It produces the guide body ready for a final
+check and STL export.
 
 #### Known limits
 
-- The output is a mesh, or a faceted solid (one face per triangle). For a smooth
-  solid, convert it with another tool (for example Mesh to Part).
-- The solid output needs pymeshlab in the external Python.
+- The bone must be a solid or Form body; convert a mesh with Mesh to Part first.
 - Bodies are read in model space: a bone inside a moved component occurrence is not
   handled yet.
 - Sleeves (cannulas) as separate parts are not generated; tubes and holes are.
-- Resolution is the voxel size of the field: details much smaller than a voxel are
-  lost.
+- Convex bends of the outline tighter than 1.25 x the rim round are opened (the
+  outline moves there, by about 0.3 mm on the test case); the report says where.
 
 ## Bone Curve in detail
 
@@ -327,38 +309,40 @@ inside the tool 12-25 s.
 
 ## Guide Base in detail
 
-Pick the bone, the closed outline (one or several sketch curves that join) and,
-optionally, **Holes**: cylindrical faces or cylinder bodies, each cut through at
-its own radius.
+The base is built the way it would be by hand in Fusion, from bodies:
 
-The inputs, including the guide tubes and the output type, are listed in
-*How to use > Guide Base* above.
+1. **One surface.** The engine fits a single bicubic NURBS face to the bone over the
+   outline and 4 mm round it (a least-conformal flat map of that patch, 3 mm control
+   spacing, faired). On the test femur it lies within 0.15 mm of the bone.
+2. **Cut by the outline.** Split Face with the outline (closest point), outer face
+   deleted: one face, one closed boundary edge.
+3. **Thickened.** That face thickened by clearance + thickness, minus the same face
+   thickened by the clearance (Combine, cut). Where the fitted face dips into the
+   bone, both thickenings go up by the dip, so the measured gap is never under the
+   clearance and the base keeps its thickness. Result: three faces - top, contact,
+   one side wall - and one closed edge at each rim.
+4. **Rounded.** Rim round on the top edge, contact round on the bottom edge.
 
-The base is **one field expression**, contoured once:
+Two things decide whether the rim round builds, both measured on the test case:
 
-- `d(x)`: signed distance to the bone (dense samples with interpolated normals).
-- `w(x)`: signed distance to the **wall** - the ruled surface of bone normals
-  standing on the outline.
-- base = `{clearance < d < clearance + thickness}` and `{w < 0}`, the top/wall
-  edge rounded with a circular blend (Quilez's round intersection), holes cut by
-  `max(f, r - distance to axis)`.
+- **A round cannot be larger than a convex bend it rolls round**, and Fusion fails
+  unpredictably when the two are close (1.5 - 1.8 mm failed on a 1.77 mm bend; 2.0
+  built in some runs and not in others). So convex bends tighter than 1.25 x the rim
+  round are opened first: a morphological opening (erode, then dilate by the same
+  disc) of the region inside the outline, on the surface's flat map. It changes only
+  those bends: on the test outline the tightest went from 1.77 to 3.2 mm and the
+  outline moved 0.30 mm at most (p95 0.12 mm).
+- **A closed edge has one vertex, where the closed outline starts**, and a round
+  fails if that vertex sits in a bend: with it in a 2.2 mm bend, every round from
+  1.5 to 2.5 mm failed; started on the straightest stretch, every round from 0.5 to
+  2.5 mm built. The outline is restarted there, and if the round still fails the base
+  is rebuilt with the outline starting on the next straight stretch (up to three
+  tries; the report says how many were needed).
 
-So the contact face is the bone offset by the clearance exactly; the top is the
-true offset at clearance + thickness (a concave spot rounds off instead of
-folding); the wall stands perpendicular to the bone all round, so **side tabs
-that wrap the bone keep their thickness** - which a loft or a plan-view
-extrusion does not; and the round is a property of the field, so it cannot fail
-and never touches the contact face. The result is a watertight mesh body in its
-own base feature, converted to a faceted solid when **Output** asks for it.
-
-Measured on a distal radius test case (the radius as the bone, offline scripts):
-
-- From the footprint outline of the case's own guide, the base regenerates that
-  guide: volume 2,227 vs 2,235 mm3, generated-to-guide p95 0.73 mm,
-  guide-to-generated p95 0.58 mm,
-  contact face 0.200 mm. 45 s at 0.15 mm.
-- In Fusion, on the intersection contour after a 4 mm drag: 342 k triangles,
-  contact 0.200 mm, 18 holes, 44 s.
+Measured on an artificial femur (the bone a Mesh to Part quad-remesh Form, 433 faces):
+three runs: gap to the bone 0.200 mm, overlap 0, rim 2 mm and contact 0.2 mm rounds built
+at the first try every time, 12 tubes each 0.200 mm off the bone, 94 - 96 s in all
+(fit 17 s, split 11 s, thicken 5 s, rounds 27 s, tubes 18 s).
 
 ## Install
 

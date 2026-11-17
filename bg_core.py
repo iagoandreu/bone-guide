@@ -1035,24 +1035,30 @@ def brep_report(p, rep):
         if rep.get('holes'):
             txt += '\n%d holes cut.' % rep['holes']
         return txt
+    gap = rep.get('bone_gap') or {}
     txt = ('Guide base: %s, %d faces, %.0f mm3, in %.0f s.\n'
-           'Contact face: the bone offset %.2f mm, within %.3f mm of it (p99 %.3f) '
-           'inside the outline (%.0f mm long).\n'
-           'Thickness as built %.2f-%.2f mm (asked %.2f); thinner only in hollows '
-           'tighter than the thickness.' % (
+           'Built from one surface fitted to the bone (within %.3f mm of it), cut by the '
+           'outline, thickened %.2f mm minus %.2f mm.' % (
                'solid' if rep.get('solid') else 'NOT solid', rep.get('faces', 0),
-               rep.get('volume_mm3', 0.0), rep.get('secs', 0.0), p['clearance'],
-               f.get('b_dev_max_mm', 0.0), f.get('b_dev_p99_mm', 0.0), f.get('outline_mm', 0.0),
-               f.get('thickness_min_mm', 0.0), f.get('thickness_max_mm', 0.0), p['thickness']))
+               rep.get('volume_mm3', 0.0), rep.get('secs', 0.0), f.get('dev_max_mm', 0.0),
+               p['clearance'] + p['thickness'] + rep.get('clearance_added_mm', 0.0),
+               p['clearance'] + rep.get('clearance_added_mm', 0.0)))
+    if gap:
+        txt += ('\nMeasured: base %.3f mm from the bone at the closest (clearance %.2f), '
+                'overlap %.3f mm3.' % (gap['min_mm'], p['clearance'], gap['overlap_mm3']))
     for key, label in (('rim', 'Rim round'), ('contact', 'Contact edge round')):
         rr = rep.get(key)
         if rr:
             txt += ('\n%s %.2f mm: %s' % (label, rr.get('radius_mm', 0.0), 'done' if rr.get('ok')
-                                           else 'NOT built - %s' % rr.get('msg', '')))
-    if f.get('cut_bridged_mm'):
-        txt += ('\nThe outline crosses a groove tighter than the base is tall over %.0f mm; '
-                'there the cut bridges it, at most %.2f mm from the projected outline.'
-                % (f['cut_bridged_mm'], f.get('cut_moved_max_mm', 0.0)))
+                                           else 'NOT built - %s' % rr.get('msg', '').strip()))
+    if rep.get('attempts', 1) > 1:
+        txt += ('\nThe rim round needed %d tries (the outline restarted on another straight '
+                'stretch each time).' % rep['attempts'])
+    if f.get('open_radius_mm'):
+        txt += ('\nConvex bends of the outline tighter than %.2f mm (tightest %.2f) were opened '
+                'for the rim round: the outline moved %.2f mm at most there.'
+                % (1.25 * p['round'], f.get('rim_tightest_before_mm', 0.0),
+                   f.get('eased_moved_max_mm', 0.0)))
     rows = rep.get('tubes') or []
     if rows:
         txt += '\n\n%d guide tubes:' % len(rows)
@@ -1063,15 +1069,16 @@ def brep_report(p, rep):
                 txt += '\n  %s: %s, axis %.0f deg off the bone normal%s' % (
                     r['name'], 'pentagon' if r['kind'] == 'pent' else 'cylinder',
                     r['tilt_deg'], '' if r['round'] == 'ok' else ', round NOT built (%s)'
-                    % r['round']) + ('' if str(r.get('gap', 'ok')).startswith('ok') else
-                                     ', gap NOT applied (%s)' % r.get('gap'))
+                    % r['round']) + (
+                    (', ' + str(r['gap']).split(', ', 2)[-1]) if str(r.get('gap', 'ok')).startswith('ok')
+                    else ', gap NOT applied (%s)' % r.get('gap'))
         if rep.get('tubes_note'):
             txt += '\n  ' + rep['tubes_note']
     if rep.get('holes'):
         txt += '\n%d holes cut.' % rep['holes']
-    txt += ('\n\nTime: fit %.0f s, assemble %.0f s, cut %.0f s, rim %.0f s.'
-            % (rep.get('engine_s', 0), rep.get('assemble_s', 0), rep.get('cut_s', 0),
-               rep.get('rim_s', 0)))
+    txt += ('\n\nTime: fit %.0f s, split %.0f s, thicken %.0f s, rounds %.0f s, tubes %.0f s.'
+            % (rep.get('engine_s', 0), rep.get('split_s', 0), rep.get('thicken_s', 0),
+               rep.get('rim_s', 0), rep.get('tubes_s', 0)))
     return txt
 
 
@@ -1267,17 +1274,17 @@ def on_created(app, cmd):
                 ('clearance', 'Clearance', 'Gap between the bone and the base: the surface '
                  'is offset this far off the bone before it is thickened.'),
                 ('thickness', 'Thickness', 'Of the base, from the offset surface outward.'),
-                ('round', 'Rim round', 'Round on the outer (top) rim; 0 for none. It needs '
-                 'room: outline corners clearly wider than the radius.'),
+                ('round', 'Rim round', 'Round on the outer (top) rim; 0 for none. Convex '
+                 'bends of the outline tighter than 1.25 x this are opened first.'),
                 ('round_contact', 'Contact edge round', 'Round on the edge at the bone; 0 '
                  'leaves it sharp.')):
             vi = inputs.addValueInput(iid, lab, 'mm', rl(float(o[iid]) * MM))
             vi.tooltip = tip
-        info = inputs.addTextBoxCommandInput('info', '', 'The bone\'s own surface inside '
-                                             'the outline (projected along the bone\'s '
-                                             'normals), offset by the clearance and '
-                                             'thickened; tubes and holes as solid bodies. '
-                                             'No mesh.', 4, True)
+        info = inputs.addTextBoxCommandInput('info', '', 'The bone round the outline as one '
+                                             'surface, cut by the outline, thickened by '
+                                             'clearance + thickness minus the clearance, '
+                                             'then rounded; tubes and holes as solid '
+                                             'bodies. No mesh.', 4, True)
         info.isFullWidth = True
 
 
@@ -2131,6 +2138,19 @@ def dev_bodies(app, job):
              'visible': b.isVisible} for b in _all_bodies(app)]
 
 
+def dev_export_mesh(app, job):
+    """Read-only: a named body's triangles (mm, float64 / int32) to job['path']_v/_f.bin."""
+    b = _body(app, job['name'])
+    if b is None:
+        return {'error': 'no body %r' % job['name']}
+    c, t = body_triangles(b)
+    with open(job['path'] + '_v.bin', 'wb') as fh:
+        array.array('d', [v * CM for v in c]).tofile(fh)
+    with open(job['path'] + '_f.bin', 'wb') as fh:
+        array.array('i', t).tofile(fh)
+    return {'nodes': len(c) // 3, 'tris': len(t) // 3}
+
+
 def dev_capture(app, job):
     """Viewport image looking at `target` (mm) from `direction`, `extent` mm wide."""
     vp = app.activeViewport
@@ -2253,7 +2273,7 @@ def dev_brep_test(app, job):
     tbm = adsk.fusion.TemporaryBRepManager.get()
     names = [job['bone']] + list(job.get('tubes_cyl', [])) + list(job.get('tubes_pent', []))
     copies = []
-    for n in names:
+    for n in names[1 if job.get('bone_tsm') else 0:]:
         b = _body(app, n)
         if b is None or not adsk.fusion.BRepBody.cast(b):
             return {'error': 'no BRep body %r' % n}
@@ -2279,6 +2299,16 @@ def dev_brep_test(app, job):
         finally:
             base.finishEdit()
         bodies = [base.bodies.item(i) for i in range(base.bodies.count)]
+        if job.get('bone_tsm'):
+            # the bone as a Form built from a TSM file (a Mesh to Part remesh)
+            with open(job['bone_tsm'], encoding='utf-8') as fh:
+                text = fh.read()
+            ff = root.features.formFeatures.add()
+            ff.startEdit()
+            ff.tSplineBodies.addByTSMDescription(text)
+            ff.finishEdit()
+            bodies = [ff.bodies.item(0)] + bodies
+            out['bone_faces'] = bodies[0].faces.count
         for b, n in zip(bodies, names):
             b.name = n
         sk2 = root.sketches.add(root.xYConstructionPlane)
@@ -2561,6 +2591,60 @@ def dev_probe_thicken(app, job):
     return out
 
 
+def dev_probe_gap(app, job):
+    """Scratch document: a tube cut by a cylinder 'bone', its cut faces offset by
+    +-gap, and the result measured (min distance, overlap volume) - which sign of
+    Offset Faces makes the gap. Closed unsaved."""
+    ui = app.userInterface
+    if ui.activeCommand != 'SelectCommand':
+        return {'refused': 'Fusion is busy (%s)' % ui.activeCommand}
+    BB = _brep()
+    prev = app.activeDocument
+    doc = app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
+    out = {}
+    try:
+        des = _design(app)
+        des.designType = adsk.fusion.DesignTypes.ParametricDesignType
+        comp = des.rootComponent
+        tbm = adsk.fusion.TemporaryBRepManager.get()
+        P = adsk.core.Point3D.create
+        for sign in (-1.0, 1.0):
+            bone_t = tbm.createCylinderOrCone(P(-5, 0, 0), 1.5, P(5, 0, 0), 1.5)
+            tube_t = tbm.createCylinderOrCone(P(0.3, 0, 0.5), 0.35, P(0.3, 0, 4.0), 0.35)
+            bodies, _ = BB.add_bodies(comp, [bone_t, tube_t], ['bone %+d' % sign, 'tube %+d' % sign])
+            bone, tube = bodies
+            BB.combine(comp, tube, [bone], adsk.fusion.FeatureOperations.CutFeatureOperation, True)
+            tube = [b for b in comp.bRepBodies if b.name == 'tube %+d' % sign][0]
+            faces = [f for f in tube.faces if bone.pointContainment(f.pointOnFace) ==
+                     adsk.fusion.PointContainment.PointOnPointContainment]
+            v0 = tube.volume
+            oin = comp.features.offsetFacesFeatures.createInput(
+                faces, adsk.core.ValueInput.createByReal(sign * 0.02))
+            comp.features.offsetFacesFeatures.add(oin)
+            tube = [b for b in comp.bRepBodies if b.name == 'tube %+d' % sign][0]
+            md = app.measureManager.measureMinimumDistance(tube, bone)
+            inter = tbm.copy(tube)
+            try:
+                tbm.booleanOperation(inter, tbm.copy(bone),
+                                     adsk.fusion.BooleanTypes.IntersectionBooleanType)
+                ov = inter.volume * 1000.0
+            except Exception:
+                ov = 0.0
+            out['sign %+d' % sign] = {'faces': len(faces), 'vol_before_mm3': round(v0 * 1000, 3),
+                                      'vol_after_mm3': round(tube.volume * 1000, 3),
+                                      'min_dist_mm': round(md.value * CM, 4),
+                                      'overlap_mm3': round(ov, 4)}
+            bone.isLightBulbOn = False
+            tube.isLightBulbOn = False
+    except Exception:
+        out['error'] = short_error(traceback.format_exc())
+    finally:
+        doc.close(False)
+        if prev:
+            prev.activate()
+    return out
+
+
 def dev_probe_chain(app, job):
     """Scratch (Untitled) documents only: chained rounds on the whole bottom and
     top loops of 'Guide base' (bottom = the face nearest the bone), each undone."""
@@ -2613,6 +2697,7 @@ DEV_COMMANDS = {
     'probe_cyl': dev_probe_cyl,
     'probe_thicken': dev_probe_thicken,
     'probe_chain': dev_probe_chain,
+    'probe_gap': dev_probe_gap,
     'ping': dev_ping,
     'new_test_doc': dev_new_test_doc,
     'close_doc': dev_close_doc,
@@ -2627,6 +2712,7 @@ DEV_COMMANDS = {
     'base_selftest': dev_base_selftest,
     'convert_probe': dev_convert_probe,
     'bodies': dev_bodies,
+    'export_mesh': dev_export_mesh,
     'shutdown': dev_shutdown,
     'capture': dev_capture,
     'visible': dev_visible,

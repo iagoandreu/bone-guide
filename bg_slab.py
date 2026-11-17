@@ -865,3 +865,265 @@ def ease_convex(bone, P, N, out, r_min, step=0.25, heights=(0.0,)):
         P = (1 - w[:, None]) * P + w[:, None] * Psm
         P, N, _f = bone.closest(P)
     return P, N, eased
+
+
+# --------------------------------------------------------------------------- #
+# the base from ONE surface: Fusion splits it with the outline and thickens it
+# --------------------------------------------------------------------------- #
+
+def bone_surface(bone, Q, spacing=3.0, margin=4.0, fair=0.02, log=None, rim=0.0,
+                 height=0.0, do_open=True):
+    """One bicubic NURBS face lying on the bone over the outline and `margin` mm
+    round it, u x v along the bone's outward normal. Fusion splits it with the
+    outline (closest point), keeps the inside, and thickens that single face -
+    one face, so the base has one rim edge at the top and one at the bottom.
+    Returns (net, ku, kv, rep) with a point inside the outline on the bone and
+    the bone normal there.
+
+    rim: the round wanted on the top edge. A convex bend of the outline tighter
+    than that cannot take it (the round would have to be larger than the corner
+    it rolls round), so bends under 1.25 x rim - on the bone and at the top,
+    `height` up - are opened just enough, on the bone; the eased outline comes
+    back in rep['outline_eased'] for Fusion to split with, and how far it moved."""
+    log = log or (lambda *_: None)
+    P, N = E.attach(bone, np.asarray(Q, float), 0.25, 0.0)
+    T, Ns, B = E.frames(P, N, 0.25)
+    inside_v, out = E.inside_labels(bone, P, B)
+    m = bone.mesh
+    Vb = np.asarray(m.vertices)
+    dq, _i = cKDTree(P).query(Vb, distance_upper_bound=margin, workers=-1)
+    keepv = inside_v | np.isfinite(dq)
+    keep = np.where(keepv[m.faces].all(1))[0]
+    sub = m.submesh([keep], append=True)
+    sub.merge_vertices()
+    g = coo_matrix((np.ones(len(sub.edges_unique)), (sub.edges_unique[:, 0],
+                                                      sub.edges_unique[:, 1])),
+                   shape=(len(sub.vertices),) * 2)
+    _n, lab = connected_components(g, directed=False)
+    big = np.argmax(np.bincount(lab))
+    sub = sub.submesh([np.where(lab[sub.faces[:, 0]] == big)[0]], append=True)
+    sub.merge_vertices()
+    V, F = np.asarray(sub.vertices), np.asarray(sub.faces)
+    UV = lscm(V, F)
+    _p, Nv, _f = bone.closest(V)
+    tri = F[np.argmax(np.linalg.norm(np.cross(V[F[:, 1]] - V[F[:, 0]],
+                                              V[F[:, 2]] - V[F[:, 0]]), axis=1))]
+    a3 = np.cross(V[tri[1]] - V[tri[0]], V[tri[2]] - V[tri[0]])
+    a2d = np.cross(UV[tri[1]] - UV[tri[0]], UV[tri[2]] - UV[tri[0]])
+    if (a3 @ Nv[tri].mean(0)) * a2d < 0:
+        UV[:, 1] = -UV[:, 1]
+    lo, hi = UV.min(0), UV.max(0)
+    Lu, Lv = hi - lo
+    W = (UV - lo) / (hi - lo)
+    nu = int(np.clip(round(Lu / spacing) + 3, 6, 90))
+    nv = int(np.clip(round(Lv / spacing) + 3, 6, 90))
+    sel = subsample(len(V), 40000)
+    net, ku, kv = fit_free(W[sel], V[sel], nu, nv, fair)
+    _pp, ins = cKDTree(Vb).query(V)
+    inside = inside_v[ins]
+    chk = np.where(inside)[0]
+    chk = chk[subsample(len(chk), 200000, 2)]
+    S = eval_surface(net, ku, kv, W[chk])
+    Sb, Nsb, _fs = bone.closest(S)
+    # how far the surface dips INTO the bone: the clearance is added on top of it
+    sunk = np.einsum('ij,ij->i', Sb - S, Nsb)
+    dev = np.linalg.norm(Sb - S, axis=1)
+    eased_rep = {}
+    if rim > 0:
+        P, eased_rep = open_for_rim(bone, P, V, F, UV, lo, hi, net, ku, kv, out,
+                                    float(rim), float(height), do_open=do_open)
+        if eased_rep.get('outline_eased'):
+            _P, N, _f = bone.closest(P)
+            T, Ns, B = E.frames(P, N, 0.25)
+            inside_v, out = E.inside_labels(bone, P, B)
+            _pp, ins = cKDTree(Vb).query(V)
+            inside = inside_v[ins]
+            chk = np.where(inside)[0]
+            chk = chk[subsample(len(chk), 200000, 2)]
+    # a point well inside the outline: the inside vertex farthest from it
+    din, _j = cKDTree(P).query(V[chk])
+    k = chk[int(np.argmax(din))]
+    rep = {'nu': nu, 'nv': nv, 'map_mm': [float(Lu), float(Lv)],
+           'dev_max_mm': float(dev.max()), 'dev_p99_mm': float(np.percentile(dev, 99)),
+           'sunk_max_mm': float(max(0.0, sunk.max())),
+           'outline_mm': float(E.arclength(P)[-1]),
+           'inside': V[k].tolist(), 'inside_normal': Nv[k].tolist(),
+           'inside_depth_mm': float(din.max()), **eased_rep}
+    log('bone surface %dx%d, %.3f mm max off the bone' % (nu, nv, dev.max()))
+    return net, ku, kv, rep
+
+
+def surface_normals(net, ku, kv, res=(500, 300)):
+    """Normal of the fitted surface at any point near it (nearest dense sample),
+    turned to agree with the bone normals N_ref."""
+    g = np.stack(np.meshgrid(np.linspace(0, 1, res[0]), np.linspace(0, 1, res[1]),
+                             indexing='ij'), -1).reshape(-1, 2)
+    X = eval_surface(net, ku, kv, g)
+    h = 1e-4
+    du = (eval_surface(net, ku, kv, np.c_[np.clip(g[:, 0] + h, 0, 1), g[:, 1]])
+          - eval_surface(net, ku, kv, np.c_[np.clip(g[:, 0] - h, 0, 1), g[:, 1]]))
+    dv = (eval_surface(net, ku, kv, np.c_[g[:, 0], np.clip(g[:, 1] + h, 0, 1)])
+          - eval_surface(net, ku, kv, np.c_[g[:, 0], np.clip(g[:, 1] - h, 0, 1)]))
+    n = _unit3(np.cross(du, dv))
+    tree = cKDTree(X)
+
+    def at(P, N):
+        m = n[tree.query(P)[1]]
+        return m * np.sign(np.einsum('ij,ij->i', m, N))[:, None]
+    return at
+
+
+def rim_bend(P, Nn, B, out, H, step=0.25):
+    """Curvature of the rim curve P + H Nn where it turns towards the inside."""
+    from scipy.ndimage import gaussian_filter1d
+    Y = P + H * Nn
+    sY = np.linalg.norm(np.roll(Y, -1, 0) - np.roll(Y, 1, 0), axis=1)
+    TY = (np.roll(Y, -1, 0) - np.roll(Y, 1, 0)) / np.maximum(sY, 1e-9)[:, None]
+    dT = (np.roll(TY, -1, 0) - np.roll(TY, 1, 0)) / np.maximum(sY, 1e-9)[:, None]
+    return gaussian_filter1d(-np.einsum('ij,ij->i', dT, B * out), 2, mode='wrap')
+
+
+def ease_for_rim(bone, P, normal_at, out, r_min, heights, step=0.25):
+    """Convex bends of the rim - on the bone and at each height up the wall,
+    the wall standing along the FITTED surface's normals as Fusion's thicken
+    makes it - opened to r_min, smoothing only around them and laying the
+    outline back on the bone. Returns (P, samples eased, (tightest R before,
+    after))."""
+    from scipy.ndimage import gaussian_filter1d, maximum_filter1d
+    eased = 0
+    first = None
+    for _ in range(60):
+        _P, N, _f = bone.closest(P)
+        T, Ns, B = E.frames(P, N, step)
+        # the nearest-sample normal is piecewise constant; along the outline the
+        # wall's direction is smooth, and 3.7 mm up a step in it reads as a kink
+        Nn = _unit3(gaussian_filter1d(normal_at(P, N), 1.0 / step, axis=0, mode='wrap'))
+        kg = np.max([rim_bend(P, Nn, B, out, h, step) for h in heights], axis=0)
+        tight = 1.0 / max(kg.max(), 1e-9)
+        first = tight if first is None else first
+        bad = kg > 1.0 / r_min
+        if not bad.any():
+            break
+        win = maximum_filter1d(bad.astype(float), int(4.0 / step), mode='wrap') > 0
+        eased = max(eased, int(win.sum()))
+        w = gaussian_filter1d(win.astype(float), 1.0 / step, mode='wrap')
+        w = np.clip(w / max(w.max(), 1e-9), 0.0, 1.0)
+        Psm = gaussian_filter1d(P, 1.0 / step, axis=0, mode='wrap')
+        P = (1 - w[:, None]) * P + w[:, None] * Psm
+        P, N, _f = bone.closest(P)
+    return P, eased, (float(first), float(tight))
+
+
+def open_for_rim(bone, P, V, F, UV, lo, hi, net, ku, kv, out, rim, height, step=0.25,
+                 px=0.08, do_open=True):
+    """The outline with every convex bend tighter than 1.25 x rim opened to that
+    radius - and nothing else moved: a morphological OPENING (erode, then dilate
+    by the same disc) of the region inside it, on the surface's flat (LSCM) map.
+    A round larger than the bend it rolls round cannot be built, and Fusion
+    fails on rounds near that limit unpredictably, so the bends are taken clear
+    of it. Measured on the wall as Fusion's thicken makes it (the fitted
+    surface's normals), at the bone and at the top. With do_open off the outline
+    keeps its shape and only its start moves. Returns (P, report)."""
+    from scipy.ndimage import gaussian_filter1d
+    want = 1.25 * rim
+    normal_at = surface_normals(net, ku, kv)
+
+    def tightest(Q):
+        _q, N, _f = bone.closest(Q)
+        _T, _Ns, B = E.frames(Q, N, step)
+        Nn = _unit3(gaussian_filter1d(normal_at(Q, N), 1.0 / step, axis=0, mode='wrap'))
+        kg = np.max([rim_bend(Q, Nn, B, out, h, step) for h in (0.0, height)], axis=0)
+        return 1.0 / max(kg.max(), 1e-9)
+    before = tightest(P)
+    rep = {'rim_tightest_before_mm': round(before, 3)}
+    if before >= want or not do_open:
+        Q = P
+        after = before
+        R, sc, loops = 0.0, 1.0, []
+    else:
+        Q, R, sc, after, loops = _opened(bone, P, V, F, UV, lo, hi, net, ku, kv, want, rim,
+                                         tightest, step, px)
+    # the closed edge's one vertex - where the thickened wall's seam meets the
+    # rim - goes where the outline is straightest: a vertex inside a bend is
+    # where Fusion's rounds fail
+    _q, N, _f = bone.closest(Q)
+    _T, _Ns, B = E.frames(Q, N, step)
+    bend = np.abs(gaussian_filter1d(rim_bend(Q, normal_at(Q, N), B, out, 0.0, step), 8.0,
+                                    mode='wrap'))
+    Q = np.roll(Q, -int(np.argmin(bend)), axis=0)
+    bend = np.roll(bend, -int(np.argmin(bend)))
+    # further straight stretches, 40 mm apart, for a retry if the round fails
+    starts = [0]
+    sQ = E.arclength(Q)[:len(Q)]
+    for i in np.argsort(bend):
+        if all(min(abs(sQ[i] - sQ[j]), sQ[-1] - abs(sQ[i] - sQ[j])) > 40.0 for j in starts):
+            starts.append(int(i))
+        if len(starts) == 4:
+            break
+    moved, _i = cKDTree(Q).query(P)
+    back, _j = cKDTree(P).query(Q)
+    rep.update({'outline_eased': Q[::4].tolist(), 'starts': [i // 4 for i in starts],
+                'open_radius_mm': round(R, 3),
+                'map_scale_p5': round(sc, 4), 'rim_tightest_after_mm': round(after, 3),
+                'eased_moved_max_mm': round(float(max(moved.max(), back.max())), 3),
+                'eased_moved_p95_mm': round(float(np.percentile(back, 95)), 3),
+                'eased_mm': round(float((back > 0.05).sum()) * step, 1),
+                'loops': len(loops)})
+    return Q, rep
+
+
+def _opened(bone, P, V, F, UV, lo, hi, net, ku, kv, want, rim, tightest, step, px):
+    """The morphological opening itself (see open_for_rim)."""
+    from scipy.ndimage import distance_transform_edt, gaussian_filter1d
+    from matplotlib.path import Path
+    import contourpy
+    # the outline in the flat map: barycentric in the patch's own triangles
+    sub = E.Bone(V, F, step=0.5)
+    _q, _n, f = sub.closest(P)
+    T = V[F[f]]
+    v0, v1, v2 = T[:, 1] - T[:, 0], T[:, 2] - T[:, 0], _q - T[:, 0]
+    d00, d01, d11 = (v0 * v0).sum(1), (v0 * v1).sum(1), (v1 * v1).sum(1)
+    d20, d21 = (v2 * v0).sum(1), (v2 * v1).sum(1)
+    den = d00 * d11 - d01 * d01
+    b1 = (d11 * d20 - d01 * d21) / den
+    b2 = (d00 * d21 - d01 * d20) / den
+    uv = (1 - b1 - b2)[:, None] * UV[F[f, 0]] + b1[:, None] * UV[F[f, 1]] + b2[:, None] * UV[F[f, 2]]
+    # the map is conformal, not isometric: a disc of R mm is R / scale in it.
+    # The smallest scale along the outline makes it at least R everywhere.
+    a3 = np.linalg.norm(np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]]), axis=1)
+    a2 = np.abs(np.cross(UV[F[:, 1]] - UV[F[:, 0]], UV[F[:, 2]] - UV[F[:, 0]]))
+    scale = np.sqrt(a3 / np.maximum(a2, 1e-12))
+    sc = float(np.percentile(scale[np.unique(f)], 5))
+    R = want
+    for _attempt in range(4):
+        r_uv = R / sc
+        pad = 3 * r_uv
+        g0 = uv.min(0) - pad
+        n = np.ceil((uv.max(0) + pad - g0) / (px / sc)).astype(int)
+        h = px / sc
+        xs = g0[0] + h * np.arange(n[0])
+        ys = g0[1] + h * np.arange(n[1])
+        X, Y = np.meshgrid(xs, ys, indexing='ij')
+        inside = Path(uv).contains_points(np.c_[X.ravel(), Y.ravel()]).reshape(X.shape)
+        eroded = distance_transform_edt(inside) * h > r_uv
+        if not eroded.any():
+            return P, dict(rep, error='the outline is narrower than the round everywhere')
+        field = distance_transform_edt(~eroded) * h - r_uv
+        lines = contourpy.contour_generator(xs, ys, field.T).lines(0.0)
+        loops = [np.asarray(l) for l in lines if len(l) > 20]
+        loop = max(loops, key=len)
+        # resample at `step` mm (through the map scale), back onto the surface and bone
+        seg = np.linalg.norm(np.diff(loop, axis=0), axis=1)
+        sarc = np.r_[0, np.cumsum(seg)]
+        m = max(64, int(sarc[-1] * sc / step))
+        tt = np.linspace(0, sarc[-1], m, endpoint=False)
+        loop = np.c_[np.interp(tt, sarc, loop[:, 0]), np.interp(tt, sarc, loop[:, 1])]
+        loop = gaussian_filter1d(loop, 2.0, axis=0, mode='wrap')     # the raster's steps
+        Wn = (loop - lo) / (hi - lo)
+        Q = eval_surface(net, ku, kv, np.clip(Wn, 0, 1))
+        Q, _n2, _f2 = bone.closest(Q)
+        after = tightest(Q)
+        if after >= rim * 1.15:
+            break
+        R *= 1.15
+    return Q, R, sc, after, loops

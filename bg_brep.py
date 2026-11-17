@@ -21,6 +21,7 @@ Parameters and reports in mm; geometry handed to Fusion in cm.
 
 import importlib
 import importlib.util
+import json
 import math
 import os
 import sys
@@ -225,13 +226,14 @@ def band_face(lo, hi):
     return body
 
 
-def build_base(app, srv_ask, bone_paths, curves, p, rep, log):
+def build_base(app, srv_ask, bone_paths, curves, p, rep, log, bone=None):
     """The base alone: engine slab -> Fusion solid -> curtain cut -> rim round.
     On failure every feature it made is deleted again, so a failed run leaves
     nothing behind in the design."""
     made = []
+    build = _build_base if p.get('base_mode') == 'slab' else _build_base_surface
     try:
-        return _build_base(app, srv_ask, bone_paths, curves, p, rep, log, made)
+        return build(app, srv_ask, bone_paths, curves, p, rep, log, made, bone)
     except Exception:
         if p.get('_debug'):
             raise
@@ -243,7 +245,271 @@ def build_base(app, srv_ask, bone_paths, curves, p, rep, log):
         raise
 
 
-def _build_base(app, srv_ask, bone_paths, curves, p, rep, log, made):
+def surface_body(r):
+    """The engine's net as a one-face open surface body (u-major net; u x v along
+    the bone's outward normal), its four boundary rows as the edges."""
+    nu, nv = int(r['nu']), int(r['nv'])
+    net = [_pt(_cm(q)) for q in r['net']]
+    ku, kv = list(r['ku']), list(r['kv'])
+
+    def at(i, j):
+        return net[i * nv + j]
+    Open = adsk.core.NurbsSurfaceProperties.OpenNurbsSurface
+    surf = adsk.core.NurbsSurface.create(3, 3, nu, nv, net, ku, kv, [], Open, Open)
+    if surf is None:
+        raise RuntimeError('the bone surface would not build')
+    bd = adsk.fusion.BRepBodyDefinition.create()
+    bd.doFullHealing = True
+    shell = bd.lumpDefinitions.add().shellDefinitions.add()
+    c = [bd.createVertexDefinition(q) for q in (at(0, 0), at(nu - 1, 0),
+                                                at(nu - 1, nv - 1), at(0, nv - 1))]
+    rows = [([at(i, 0) for i in range(nu)], ku, 0, 1),
+            ([at(nu - 1, j) for j in range(nv)], kv, 1, 2),
+            ([at(i, nv - 1) for i in range(nu)], ku, 3, 2),
+            ([at(0, j) for j in range(nv)], kv, 0, 3)]
+    eds = [bd.createEdgeDefinitionByCurve(
+        c[i0], c[i1], adsk.core.NurbsCurve3D.createNonRational(pts, 3, kn, False))
+        for pts, kn, i0, i1 in rows]
+    fd = shell.faceDefinitions.add(surf, False)
+    loop = fd.loopDefinitions.add()
+    for e, rev in zip(eds, (False, False, True, True)):
+        loop.bRepCoEdgeDefinitions.add(e, rev)
+    body = bd.createBody()
+    if body is None:
+        raise RuntimeError('the bone surface would not assemble: %s'
+                           % '; '.join(bd.outcomeInfo or []))
+    return body
+
+
+def _face_at(comp, body, q_cm, tol=0.06):
+    found = comp.findBRepUsingPoint(_pt(q_cm), adsk.fusion.BRepEntityTypes.BRepFaceEntityType,
+                                    tol, False)
+    for i in range(found.count):
+        f = adsk.fusion.BRepFace.cast(found.item(i))
+        if f and f.body.entityToken == body.entityToken:
+            return f
+    return None
+
+
+def _build_base_surface(app, srv_ask, bone_paths, curves, p, rep, log, made, bone=None):
+    """The base from ONE surface: the bone round the outline fitted as a single
+    NURBS face, split by the outline itself (closest point) and the outside
+    deleted; that face thickened by clearance + thickness, minus the same face
+    thickened by the clearance; then the rim and contact rounds. One face in,
+    so one rim edge at the top and one at the bottom."""
+    des = adsk.fusion.Design.cast(app.activeProduct)
+    comp = des.activeComponent
+    raw = outline_patch().chain_outline(curves)
+    pts_mm = [(q[0] * CM, q[1] * CM, q[2] * CM) for q in raw]
+    c, t = float(p['clearance']), float(p['thickness'])
+    t0 = time.time()
+    r = srv_ask({'op': 'surface', 'coords': bone_paths['coords'], 'tris': bone_paths['tris'],
+                 'pts': pts_mm, 'spacing': float(p.get('surface_spacing', 3.0)),
+                 'margin': 4.0, 'height': c + t, 'open': not p.get('_no_ease'),
+                 'rim': max(float(p.get('round', 0.0)), float(p.get('round_contact', 0.0)))})
+    rep['engine_s'] = round(time.time() - t0, 1)
+    rep['fit'] = r['report']
+    log('engine surface %.1f s' % rep['engine_s'])
+
+    # the closed rim edge's one vertex sits where the outline starts; a round
+    # can fail where that lands, so a failed rim round is tried again with the
+    # outline starting on another straight stretch
+    starts = r['report'].get('starts') or [0]
+    for attempt, start in enumerate(starts[:3]):
+        mine = []
+        guide = _base_attempt(app, comp, r, curves, p, rep, c, t, bone, start, mine)
+        made.extend(mine)
+        rim_ok = rep.get('rim', {}).get('ok', True)
+        rep['attempts'] = attempt + 1
+        if rim_ok or attempt == min(len(starts), 3) - 1:
+            break
+        for f in reversed(mine):
+            try:
+                f.deleteMe()
+            except Exception:
+                pass
+            made.remove(f)
+    rep['faces'] = guide.faces.count
+    if adsk.fusion.BRepBody.cast(bone):
+        rep['bone_gap'] = body_gap(guide, bone)
+    return guide
+
+
+def _base_attempt(app, comp, r, curves, p, rep, c, t, bone, start, made):
+    """Split, thicken, cut and round once, the outline starting at `start`."""
+    t1 = time.time()
+    (sb,), bf = add_bodies(comp, [surface_body(r)], ['Guide base surface'])
+    made.append(bf)
+    faces = adsk.core.ObjectCollection.create()
+    faces.add(sb.faces.item(0))
+    if r['report'].get('outline_eased'):
+        # the outline with its too-tight convex bends opened for the rim round,
+        # as a hidden sketch of its own; the user's sketch is not touched
+        sk = comp.sketches.add(comp.xYConstructionPlane)
+        sk.name = 'Guide base outline (eased)'
+        made.append(sk)
+        pts = adsk.core.ObjectCollection.create()
+        pts_ = r['report']['outline_eased']
+        for q in pts_[start:] + pts_[:start]:
+            pts.add(sk.modelToSketchSpace(_pt(_cm(q))))
+        sk.isComputeDeferred = True
+        spl = sk.sketchCurves.sketchFittedSplines.add(pts)
+        spl.isClosed = True
+        sk.isComputeDeferred = False
+        tool = spl
+    elif len(curves) == 1:
+        tool = curves[0]
+    else:
+        tool = adsk.core.ObjectCollection.create()
+        for cv in curves:
+            tool.add(cv)
+    sin = comp.features.splitFaceFeatures.createInput(faces, tool, False)
+    sin.setClosestPointSplitType()
+    made.append(comp.features.splitFaceFeatures.add(sin))
+    sb = next(b for b in comp.bRepBodies if b.name == 'Guide base surface')
+    rep['split_faces'] = sb.faces.count
+    outer = [f for f in sb.faces if f.loops.count > 1]
+    if sb.faces.count != 2 or len(outer) != 1:
+        raise RuntimeError('the outline did not split the surface into an inside and an '
+                           'outside (%d faces)' % sb.faces.count)
+    coll = adsk.core.ObjectCollection.create()
+    coll.add(outer[0])
+    made.append(comp.features.surfaceDeleteFaceFeatures.add(coll))
+    sb = next(b for b in comp.bRepBodies if b.name == 'Guide base surface')
+    face = sb.faces.item(0)
+    rep['split_s'] = round(time.time() - t1, 1)
+
+    # thicken away from the bone, whichever way the face points: a solid bone
+    # says which side of the face is inside it; a mesh bone, the engine's normal
+    q = _cm(r['report']['inside'])
+    ok, uv = face.evaluator.getParameterAtPoint(_pt(q))
+    ok, nf = face.evaluator.getNormalAtParameter(uv)
+    nf = _unit(_v(nf))
+    if adsk.fusion.BRepBody.cast(bone):
+        IN = adsk.fusion.PointContainment.PointInsidePointContainment
+        reads = {h: bone.pointContainment(_pt(_add(q, nf, h * MM))) == IN
+                 for h in (-2.0, -1.0, 1.0, 2.0)}
+        score = sum(reads[h] for h in (-2.0, -1.0)) - sum(reads[h] for h in (1.0, 2.0))
+        rep['side_reads'] = {str(h): v for h, v in reads.items()}
+        if score == 0:
+            out_side = _dot(nf, _unit(tuple(r['report']['inside_normal']))) > 0
+            rep['side_from'] = 'engine normal (containment undecided)'
+        else:
+            out_side = score > 0
+            rep['side_from'] = 'bone containment'
+    else:
+        out_side = _dot(nf, _unit(tuple(r['report']['inside_normal']))) > 0
+        rep['side_from'] = 'engine normal'
+    sign = 1.0 if out_side else -1.0
+    nb = nf if out_side else (-nf[0], -nf[1], -nf[2])
+
+    t1 = time.time()
+
+    def thicken(d_mm, name):
+        before = set(b.entityToken for b in comp.bRepBodies)
+        fc = adsk.core.ObjectCollection.create()
+        fc.add(face)
+        tin = comp.features.thickenFeatures.createInput(
+            fc, adsk.core.ValueInput.createByReal(sign * d_mm * MM), False,
+            adsk.fusion.FeatureOperations.NewBodyFeatureOperation, False)
+        made.append(comp.features.thickenFeatures.add(tin))
+        new = [b for b in comp.bRepBodies if b.isSolid and b.entityToken not in before]
+        if len(new) != 1:
+            raise RuntimeError('thickening by %.2f mm gave %d solids' % (d_mm, len(new)))
+        new[0].name = name
+        return new[0]
+
+    # where the fitted face dips into the bone, the clearance starts from there:
+    # both thickenings go up by the dip, so the gap is at least c and the base
+    # stays t thick
+    dip = float(r['report'].get('sunk_max_mm', 0.0)) if c > 0 else 0.0
+    rep['clearance_added_mm'] = round(dip, 3)
+    guide = thicken(c + dip + t, 'Guide base')
+    if c > 0:
+        inner = thicken(c + dip, 'Guide base clearance')
+        made.append(combine(comp, guide, [inner],
+                            adsk.fusion.FeatureOperations.CutFeatureOperation, False))
+        guide = next(b for b in comp.bRepBodies if b.name == 'Guide base')
+    sb.isLightBulbOn = False
+    for sk in [m for m in made if adsk.fusion.Sketch.cast(m)]:
+        sk.isVisible = False
+    rep['thicken_s'] = round(time.time() - t1, 1)
+
+    t1 = time.time()
+    if p.get('_export_rim'):
+        # dev: the top rim edge as built, with both faces' normals along it
+        f = _face_at(comp, guide, _add(q, nb, (c + dip + t) * MM))
+        dump = {'faces': guide.faces.count, 'top_edges': f.edges.count, 'edges': []}
+        for e in f.edges:
+            ok, t0_, t1_ = e.evaluator.getParameterExtents()
+            ok, pts = e.evaluator.getStrokes(t0_, t1_, 0.0005)
+            other = [x for x in e.faces if x.tempId != f.tempId]
+            rows = []
+            for pt in pts:
+                row = [pt.x * CM, pt.y * CM, pt.z * CM]
+                for face_ in [f] + other[:1]:
+                    ok1, uv_ = face_.evaluator.getParameterAtPoint(pt)
+                    ok2, nn = face_.evaluator.getNormalAtParameter(uv_)
+                    row += [nn.x, nn.y, nn.z]
+                rows.append(row)
+            dump['edges'].append({'n': len(rows), 'rows': rows,
+                                  'other_face_geom': type(other[0].geometry).__name__ if other else None})
+        dump['face_types'] = [type(x.geometry).__name__ + ':%d' % x.edges.count for x in guide.faces]
+        with open(p['_export_rim'], 'w') as fh:
+            json.dump(dump, fh)
+    if p.get('_rim_probe'):
+        # dev: which rim radii build on this edge, each tried and undone
+        probe = {}
+        for rr_mm in p['_rim_probe']:
+            f = _face_at(comp, guide, _add(q, nb, (c + dip + t) * MM))
+            coll = adsk.core.ObjectCollection.create()
+            for e in f.edges:
+                coll.add(e)
+            try:
+                fin = comp.features.filletFeatures.createInput()
+                fin.edgeSetInputs.addConstantRadiusEdgeSet(
+                    coll, adsk.core.ValueInput.createByReal(rr_mm * MM), True)
+                ft = comp.features.filletFeatures.add(fin)
+                probe[str(rr_mm)] = True
+                ft.deleteMe()
+            except Exception:
+                probe[str(rr_mm)] = False
+            guide = next(b_ for b_ in comp.bRepBodies if b_.name == 'Guide base')
+        rep['rim_probe'] = probe
+    keys = (('top', 'round', 'rim', c + dip + t), ('bottom', 'round_contact', 'contact', c + dip))
+    for key, pkey, label, h in keys:
+        rr = float(p.get(pkey, 0.0)) * MM
+        if rr <= 0:
+            continue
+        f = _face_at(comp, guide, _add(q, nb, h * MM))
+        if f is None:
+            rep[label] = {'ok': False, 'msg': '%s face not found' % key}
+            continue
+        edges = [e for e in f.edges]
+        ok, msg = fillet(comp, edges, rr, True)
+        rep[label] = {'ok': ok, 'msg': msg, 'radius_mm': rr * CM, 'edges': len(edges)}
+        guide = next(b for b in comp.bRepBodies if b.name == 'Guide base')
+    rep['rim_s'] = round(time.time() - t1, 1)
+    return guide
+
+
+def body_gap(body, bone):
+    """Measured, not assumed: the body's minimum distance to the bone (mm) and the
+    volume they share (mm3)."""
+    app = adsk.core.Application.get()
+    tbm = adsk.fusion.TemporaryBRepManager.get()
+    d = app.measureManager.measureMinimumDistance(body, bone).value * CM
+    inter = tbm.copy(body)
+    try:
+        tbm.booleanOperation(inter, tbm.copy(bone),
+                             adsk.fusion.BooleanTypes.IntersectionBooleanType)
+        ov = inter.volume * 1000.0
+    except Exception:
+        ov = 0.0
+    return {'min_mm': round(d, 4), 'overlap_mm3': round(ov, 4)}
+
+
+def _build_base(app, srv_ask, bone_paths, curves, p, rep, log, made, bone=None):
     des = adsk.fusion.Design.cast(app.activeProduct)
     comp = des.activeComponent
     op = outline_patch()
@@ -542,9 +808,27 @@ def pull_off_bone(comp, bone, b, before, gap):
         oin = comp.features.offsetFacesFeatures.createInput(
             faces, adsk.core.ValueInput.createByReal(-gap))
         comp.features.offsetFacesFeatures.add(oin)
-        return 'ok, %d faces' % len(faces)
     except Exception as exc:
         return str(exc).splitlines()[-1].strip()[:120]
+    return 'ok, %d faces, %s' % (len(faces), measured_gap(comp, bone, b['name']))
+
+
+def measured_gap(comp, bone, name):
+    """The tube's real distance to the bone after the offset, and any overlap."""
+    app = adsk.core.Application.get()
+    tbm = adsk.fusion.TemporaryBRepManager.get()
+    out = []
+    for tb in [x for x in comp.bRepBodies if x.isSolid and x.name == 'Guide tube %s' % name]:
+        d = app.measureManager.measureMinimumDistance(tb, bone).value * 10.0
+        inter = tbm.copy(tb)
+        try:
+            tbm.booleanOperation(inter, tbm.copy(bone),
+                                 adsk.fusion.BooleanTypes.IntersectionBooleanType)
+            ov = inter.volume * 1000.0
+        except Exception:
+            ov = 0.0
+        out.append('min gap %.3f mm, overlap %.3f mm3' % (d, ov))
+    return '; '.join(out) or 'not measured'
 
 
 # --------------------------------------------------------------------------- #
@@ -565,7 +849,7 @@ def build_guide(app, bone, curves, tubes, holes, p, srv_ask, bone_paths, log=Non
     des = adsk.fusion.Design.cast(app.activeProduct)
     comp = des.activeComponent
     rep = {}
-    guide = build_base(app, srv_ask, bone_paths, curves, p, rep, log) if curves else None
+    guide = build_base(app, srv_ask, bone_paths, curves, p, rep, log, bone) if curves else None
     t1 = time.time()
     axes = []
     if tubes:

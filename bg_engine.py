@@ -1062,6 +1062,31 @@ def serve():
                     rim=float(req.get('rim', 0.0)))
                 rep['secs'] = time.time() - t0
                 out = {'topo': topo, 'curtain': curtain, 'keep': keep, 'report': rep}
+            elif op == 'surface':
+                # the bone around the outline as one NURBS face (Fusion splits and
+                # thickens it)
+                import bg_slab
+                t0 = time.time()
+                V = np.fromfile(req['coords'], '<f8').reshape(-1, 3)
+                F = np.fromfile(req['tris'], '<i4').reshape(-1, 3)
+                # outward normals whatever the winding it came with: a closed bone
+                # wound inside-out has a negative signed volume
+                T0 = V[F]
+                if np.einsum('ij,ij->i', T0[:, 0], np.cross(T0[:, 1], T0[:, 2])).sum() < 0:
+                    F = F[:, ::-1].copy()
+                del T0
+                Q = np.asarray(req['pts'], float)
+                pad = float(req.get('margin', 4.0)) + 6.0
+                Vc, Fc = bg_slab.crop(V, F, Q.min(0) - pad, Q.max(0) + pad)
+                b = Bone(Vc, Fc, step=0.25)
+                net, ku, kv, rep = bg_slab.bone_surface(
+                    b, Q, float(req.get('spacing', 3.0)), float(req.get('margin', 4.0)),
+                    rim=float(req.get('rim', 0.0)), height=float(req.get('height', 0.0)),
+                    do_open=bool(req.get('open', True)))
+                rep['secs'] = time.time() - t0
+                out = {'net': net.reshape(-1, 3).tolist(), 'nu': int(net.shape[0]),
+                       'nv': int(net.shape[1]), 'ku': ku.tolist(), 'kv': kv.tolist(),
+                       'report': rep}
             elif bone is None:
                 out = {'error': 'no bone loaded'}
             elif op == 'ray':

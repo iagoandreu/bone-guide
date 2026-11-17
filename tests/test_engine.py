@@ -178,7 +178,7 @@ def test_section():
     print('section: the alpha shape of two drills, on the bone')
     b = plate()
     cyl = [{'kind': 'cyl', 'p0': [sx, 0, -12], 'p1': [sx, 0, 12], 'r': 2.0} for sx in (-4, 4)]
-    loops, info = E.section(b, cyl, margin=1.0, closing=0.0)
+    loops, info = E.section(b, cyl, margin=1.0, closing=0.0, join=False)
     r = [np.hypot(np.abs(L[:, 0]) - 4, L[:, 1]) for L in loops]
     check('no closing: two circles of radius 2 + margin 1',
           len(loops) == 2 and all(np.abs(x - 3).max() < 0.03 for x in r),
@@ -287,9 +287,43 @@ def test_tubes():
                   'min %.4f max %.4f' % (rho[ring].min(), rho[ring].max()))
 
 
+def test_join():
+    """The shapes the curve holds, by name: a cluster of two drills closed into one
+    region, a third drill 25 mm out on its own island, a fourth that stops 3 mm
+    above the bone, and a body with its own margin."""
+    print('section: every shape accounted for')
+    b = plate()
+    drill = lambda x, y, z0=-12.0, name='', **kw: dict(
+        {'kind': 'cyl', 'p0': [x, y, z0], 'p1': [x, y, 12], 'r': 2.0, 'name': name}, **kw)
+    shapes = [drill(-4, 0, name='a'), drill(4, 0, name='b'), drill(25, 0, name='far'),
+              drill(0, -16, z0=3.0, name='short')]
+    for join in (True, False):
+        loops, info = E.section(b, shapes, margin=1.0, closing=5.0, planes=False,
+                                join=join)
+        st = {r['name']: r for r in info['shapes']}
+        L = loops[0]
+        check('join=%s: the cluster is in the curve' % join,
+              st['a']['status'] == 'in' and st['b']['status'] == 'in', info['shapes'])
+        check('join=%s: the far drill is %s' % (join, 'joined' if join else 'left out'),
+              st['far']['status'] == ('joined' if join else 'out'), st['far'])
+        reach = L[:, 0].max()
+        check('join=%s: the curve %s round the far drill' % (join, 'goes' if join else 'does not go'),
+              (reach > 27.9) if join else (reach < 15.0), '%.2f mm' % reach)
+        check('join=%s: the short drill is reported 2 mm short of the bone (3 - margin 1)'
+              % join, st['short']['status'] == 'off'
+              and abs(st['short'].get('gap_mm', 0) - 2.0) < 0.01, st['short'])
+    # per-shape margins: radius 2 drills grown by 1 and by 0.5
+    two = [drill(-8, 0, name='m1'), drill(8, 0, name='m05', margin=0.5)]
+    loops, info = E.section(b, two, margin=1.0, closing=0.0, join=False)
+    r = sorted(float(np.median(np.hypot(np.abs(L[:, 0]) - 8, L[:, 1]))) for L in loops)
+    check('each shape grows by its own margin: circles of 2.5 and 3 mm',
+          len(r) == 2 and abs(r[0] - 2.5) < 0.03 and abs(r[1] - 3.0) < 0.03, r)
+
+
 def main():
     test_tubes()
     test_section()
+    test_join()
     m = bone()
     b = E.Bone(m.vertices, m.faces, np.array([-30, -30, -30.0]), np.array([30, 30, 30.0]),
                step=0.1)

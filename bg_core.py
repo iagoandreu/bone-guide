@@ -60,7 +60,8 @@ PANELS = ['SolidCreatePanel', 'SurfaceCreatePanel']
 
 DEFAULTS = {'influence': 0.0, 'smooth_mm': 1.0, 'clearance': 0.2, 'thickness': 3.5,
             'round': 1.0, 'round_contact': 0.0, 'voxel': 1, 'curve_smooth': 0.5,
-            'fit_spacing': 3.0, 'margin': 2.4, 'closing': 3.5, 'closing_mode': 0,
+            'fit_spacing': 3.0, 'margin': 2.4, 'margin2': 1.0, 'closing': 3.5,
+            'closing_mode': 0, 'join': True,
             'guide_d': 5.2, 'guide_h': 10.0, 'guide_clear': 0.5, 'guide_top_round': 1.0,
             'guide_edge_round': 1.0, 'guide_spin': 0.0, 'hole_d': 0.0, 'output': 1,
             'facet_tol': 0.05}
@@ -228,6 +229,13 @@ def python_cmd():
     return list(st.python)
 
 
+def _engine_mtime():
+    try:
+        return os.path.getmtime(ENGINE)
+    except OSError:
+        return None
+
+
 class Server:
     """bg_engine.py --serve: one JSON request per line, one answer per line."""
 
@@ -237,6 +245,7 @@ class Server:
                                      stderr=subprocess.DEVNULL, creationflags=NO_WINDOW,
                                      text=True, bufsize=1)
         self.bone_key = None
+        self.engine_mtime = _engine_mtime()
 
     def alive(self):
         return self.proc.poll() is None
@@ -268,7 +277,13 @@ def server_for(body):
     """The resident engine with this bone loaded (loaded once per bone)."""
     st = state()
     srv = st.server
-    if srv is None or not srv.alive():
+    # an edited bg_engine.py: the running process holds the old code. Checked
+    # here, not in a Server method - a server made by an older bg_core keeps its
+    # old class
+    stale = srv is not None and getattr(srv, 'engine_mtime', None) != _engine_mtime()
+    if srv is None or stale or not srv.alive():
+        if srv is not None:
+            srv.close()
         srv = st.server = Server()
     key = body_key(body)
     if srv.bone_key != key:
@@ -496,18 +511,20 @@ def as_cylinder(body):
     return _add(o, a, min(ts)), _add(o, a, max(ts)), r
 
 
-def shape_specs(entities):
+def shape_specs(entities, margin):
     """The picked shapes for the engine: a cylinder body as its exact cylinder,
-    anything else as its triangles."""
+    anything else as its triangles; each with its margin and its name."""
     out = []
     for e in entities:
         b = adsk.fusion.BRepBody.cast(e)
         cyl = as_cylinder(b) if b else None
         if cyl:
-            out.append({'kind': 'cyl', 'p0': cyl[0], 'p1': cyl[1], 'r': cyl[2]})
+            spec = {'kind': 'cyl', 'p0': cyl[0], 'p1': cyl[1], 'r': cyl[2]}
         else:
             paths = write_mesh(e)
-            out.append({'kind': 'mesh', 'coords': paths['coords'], 'tris': paths['tris']})
+            spec = {'kind': 'mesh', 'coords': paths['coords'], 'tris': paths['tris']}
+        spec.update({'margin': float(margin), 'name': getattr(e, 'name', '')})
+        out.append(spec)
     return out
 
 
@@ -624,19 +641,26 @@ def fit_under_cursor(vp, s, cursor):
 # along the curve follow too, with a cosine fall-off (3-matic's Edit Curve).
 # --------------------------------------------------------------------------- #
 
-def new_session(body, curves=None, shapes=None, p=None):
+def new_session(body, curves=None, shapes=None, p=None, shapes2=None):
     """The bone in the engine, and the curve to edit: the shapes' alpha shape
     cut with the bone, or the picked sketch curve laid on the bone, or nothing
-    (clicks then draw one)."""
+    (clicks then draw one). shapes2 take the second margin; a body picked in
+    both boxes counts once, with the second margin."""
     p = p or load_settings()
+    shapes2 = list(shapes2 or [])
+    own = set(body_key(e) for e in shapes2)
+    shapes = [e for e in (shapes or []) if body_key(e) not in own]
     s = {'bone': body, 'fit': [], 'Q': [], 'N': [], 'at': [], 'spline': None,
-         'curves': list(curves or []), 'shapes': list(shapes or []), 'drag': None,
-         'hot': None, 'undo': [], 'stats': {}}
+         'curves': list(curves or []), 'shapes': shapes, 'shapes2': shapes2,
+         'drag': None, 'hot': None, 'undo': [], 'stats': {}}
     srv = server_for(body)
-    if shapes:
-        r = srv.ask({'op': 'section', 'shapes': shape_specs(shapes),
+    if shapes or shapes2:
+        r = srv.ask({'op': 'section',
+                     'shapes': shape_specs(shapes, p['margin'])
+                     + shape_specs(shapes2, p.get('margin2', p['margin'])),
                      'margin': p['margin'], 'closing': p['closing'],
                      'planes': int(p['closing_mode']) == 0, 'spacing': p['fit_spacing'],
+                     'join': bool(p.get('join', True)),
                      'smooth': p['curve_smooth'], 'step': STEP})
         apply_answer(s, r)
         s['stats']['section'] = r['info']
@@ -1016,22 +1040,33 @@ def on_created(app, cmd):
         b = inputs.addSelectionInput('bone', 'Bone', 'The bone the curve lies on')
         b.addSelectionFilter('SolidBodies')
         b.addSelectionFilter('MeshBodies')
-        b.setSelectionLimits(1, 1)
+        # 0, not 1: editing empties the boxes (the session holds the picks), and
+        # a box short of its minimum greys OK whatever validate says
+        b.setSelectionLimits(0, 1)
         sh = inputs.addSelectionInput('shapes', 'Shapes',
                                       'Drill cylinders and other bodies, or an alpha '
                                       'shape: the curve is where they meet the bone.')
         sh.addSelectionFilter('SolidBodies')
         sh.addSelectionFilter('MeshBodies')
         sh.setSelectionLimits(0, 0)
-        for iid, lab, tip in (
-                ('margin', 'Margin', 'Grows every shape by this much before the closing: '
-                 'the cannula and the wall round it on a drill cylinder. 0 for a picked '
-                 'alpha shape.'),
-                ('closing', 'Closing radius', 'The alpha radius: gaps narrower than '
-                 'twice this between the shapes are filled. 0 cuts the shapes with the '
-                 'bone as they are.')):
-            vi = inputs.addValueInput(iid, lab, 'mm', rl(float(o[iid]) * MM))
-            vi.tooltip = tip
+        vi = inputs.addValueInput('margin', 'Margin', 'mm', rl(float(o['margin']) * MM))
+        vi.tooltip = ('Grows every shape in Shapes by this much before the closing: the '
+                      'cannula and the wall round it on a drill cylinder. 0 for a picked '
+                      'alpha shape.')
+        sh2 = inputs.addSelectionInput('shapes2', 'Shapes, own margin',
+                                       'Bodies that take the margin below instead - a '
+                                       'cutting guide, say. A body picked in both boxes '
+                                       'takes this one.')
+        sh2.addSelectionFilter('SolidBodies')
+        sh2.addSelectionFilter('MeshBodies')
+        sh2.setSelectionLimits(0, 0)
+        vi = inputs.addValueInput('margin2', 'Their margin', 'mm',
+                                  rl(float(o['margin2']) * MM))
+        vi.tooltip = 'The margin of the bodies in Shapes, own margin.'
+        vi = inputs.addValueInput('closing', 'Closing radius', 'mm',
+                                  rl(float(o['closing']) * MM))
+        vi.tooltip = ('The alpha radius: gaps narrower than twice this between the '
+                      'shapes are filled. 0 cuts the shapes with the bone as they are.')
         cm = inputs.addDropDownCommandInput('closing_mode', 'Closing',
                                             adsk.core.DropDownStyles.TextListDropDownStyle)
         for i, (_k, lab) in enumerate(CLOSINGS):
@@ -1040,6 +1075,13 @@ def on_created(app, cmd):
                       'shape lofted through plane sections is built - side tabs that '
                       'wrap round the bone edge stay with the rest. 3D: a closing by a '
                       'ball, the same in every direction.')
+        jn = inputs.addBoolValueInput('join', 'Join every shape', True, '',
+                                      bool(o['join']))
+        jn.tooltip = ('A shape further from the others than the closing bridges ends '
+                      'up on its own island, which the curve would leave out. On: each '
+                      'such island is joined to the rest by a strip along the shortest '
+                      'path over the bone, as wide as the closing. A drill that also '
+                      'cuts the far side of the bone is not bridged there.')
         c = inputs.addSelectionInput('curve', 'Or a curve',
                                      'A closed sketch curve to edit instead. With no '
                                      'shapes and no curve, clicks on the bone draw one.')
@@ -1186,7 +1228,8 @@ def _same_axis(c1, c2):
 
 def curve_params(inputs):
     p = {k: inputs.itemById(k).value * CM for k in
-         ('margin', 'closing', 'influence', 'fit_spacing', 'smooth_mm')}
+         ('margin', 'margin2', 'closing', 'influence', 'fit_spacing', 'smooth_mm')}
+    p['join'] = bool(inputs.itemById('join').value)
     it = inputs.itemById('closing_mode').selectedItem
     p['closing_mode'] = it.index if it else 0
     p['curve_smooth'] = load_settings()['curve_smooth']
@@ -1200,8 +1243,8 @@ def refresh_curve(app, cmd):
     st = state()
     s = st.session
     edit = inputs.itemById('edit').value
-    for iid in ('bone', 'shapes', 'curve', 'margin', 'closing', 'closing_mode',
-                'fit_spacing'):
+    for iid in ('bone', 'shapes', 'shapes2', 'curve', 'margin', 'margin2', 'closing',
+                'closing_mode', 'join', 'fit_spacing'):
         inputs.itemById(iid).isEnabled = not edit
     for iid in ('smooth', 'undo', 'smooth_mm'):
         inputs.itemById(iid).isEnabled = bool(edit and s)
@@ -1209,7 +1252,7 @@ def refresh_curve(app, cmd):
         txt = ('Pick the bone, then the shapes (drill cylinders, other bodies, or an '
                'alpha shape) or a closed sketch curve - or neither, to draw one. Then '
                'tick <b>Edit curve</b>.')
-    elif len(s['fit']) < 3 and not s['curves'] and not s['shapes']:
+    elif len(s['fit']) < 3 and not s['curves'] and not (s['shapes'] or s.get('shapes2')):
         txt = ('<b>Draw:</b> %d points. Click on the bone to add one (it goes where it '
                'lengthens the outline least); drag a point to move it.' % len(s['fit']))
     else:
@@ -1226,10 +1269,30 @@ def refresh_curve(app, cmd):
                        '; %d other loop%s on the bone left out (far side or islands)'
                        % (others, '' if others == 1 else 's') if others else '',
                        sec.get('secs', 0)))
+            txt += shapes_note(sec.get('shapes') or [])
         if s['stats'].get('last'):
             txt += '<br/>%s' % _esc(s['stats']['last'])
     inputs.itemById('info').formattedText = txt
     draw(app, s)
+
+
+def shapes_note(rows):
+    """The shapes the curve does not simply hold, by name."""
+    lines = []
+    for r in rows:
+        nm = _esc(r.get('name') or '?')
+        if r['status'] == 'joined':
+            lines.append('%s: on its own island, joined by a strip %.1f mm long.'
+                         % (nm, r.get('bridge_mm', 0.0)))
+        elif r['status'] == 'out':
+            lines.append('<b>%s: on its own island, left out</b> (tick Join every shape, '
+                         'or raise the closing radius).' % nm)
+        elif r['status'] == 'off':
+            gap = r.get('gap_mm')
+            lines.append('<b>%s: does not reach the bone</b> (%s even with its margin).'
+                         % (nm, '%.1f mm short' % gap if gap is not None
+                            else 'more than 5 mm away'))
+    return ''.join('<br/>' + ln for ln in lines)
 
 
 def start_session(app, cmd):
@@ -1243,7 +1306,8 @@ def start_session(app, cmd):
     p = curve_params(inputs)
     save_settings(p)
     try:
-        st.session = new_session(bone[0], _sel(inputs, 'curve'), _sel(inputs, 'shapes'), p)
+        st.session = new_session(bone[0], _sel(inputs, 'curve'), _sel(inputs, 'shapes'), p,
+                                 _sel(inputs, 'shapes2'))
     except Exception as exc:
         log(traceback.format_exc())
         inputs.itemById('edit').value = False
@@ -1253,7 +1317,7 @@ def start_session(app, cmd):
         return
     # the selection highlight paints the bone and the shapes blue over the
     # overlay: the session holds them now
-    for iid in ('bone', 'shapes', 'curve'):
+    for iid in ('bone', 'shapes', 'shapes2', 'curve'):
         inputs.itemById(iid).clearSelection()
 
 
@@ -1263,7 +1327,7 @@ def on_input_changed(app, cmd, iid):
     if cid != CMD_CURVE:
         return
     st = state()
-    if iid in ('bone', 'shapes', 'curve'):
+    if iid in ('bone', 'shapes', 'shapes2', 'curve'):
         # picking: once the bone is in, every further click goes to Shapes, and
         # Shapes keeps taking bodies until another box is clicked. Nothing else
         # is rewritten mid-pick.
@@ -1280,6 +1344,8 @@ def on_input_changed(app, cmd, iid):
                 inputs.itemById('bone').addSelection(s['bone'])
                 for e in s['shapes']:
                     inputs.itemById('shapes').addSelection(e)
+                for e in s.get('shapes2', []):
+                    inputs.itemById('shapes2').addSelection(e)
                 for c in s['curves']:
                     inputs.itemById('curve').addSelection(c)
     s = st.session
@@ -1403,7 +1469,7 @@ def press(app, s, vp, cursor, shift, influence, hit):
             begin_drag(s, k)
             s['undo'].pop()                       # one undo for insert + drag
             return 'Point added.'
-        if s['curves'] or s['shapes']:
+        if s['curves'] or s['shapes'] or s.get('shapes2'):
             return None
     push_undo(s)
     k = add_ctrl(s['fit'], hit)
@@ -1602,10 +1668,11 @@ def dev_session(app, job):
     st = state()
     curves = _sketch_curves(app, job['sketch']) if job.get('sketch') else None
     shapes = [_body(app, n) for n in job.get('shapes', [])]
+    shapes2 = [_body(app, n) for n in job.get('shapes2', [])]
     p = dict(load_settings())
     p.update(job.get('params', {}))
     t0 = time.time()
-    st.session = new_session(_body(app, job['bone']), curves, shapes, p)
+    st.session = new_session(_body(app, job['bone']), curves, shapes, p, shapes2)
     s = st.session
     _, total = arc_positions(s['Q']) if len(s['Q']) > 1 else (None, 0)
     return {'fit': len(s['fit']), 'samples': len(s['Q']), 'length_mm': total,
@@ -2019,6 +2086,8 @@ def dev_dialog(app, job):
         inputs.itemById('bone').addSelection(_body(app, job['bone']))
         for n in job.get('shapes', []):
             inputs.itemById('shapes').addSelection(_body(app, n))
+        for n in job.get('shapes2', []):
+            inputs.itemById('shapes2').addSelection(_body(app, n))
         if job.get('sketch'):
             for c in _sketch_curves(app, job['sketch']):
                 inputs.itemById('curve').addSelection(c)

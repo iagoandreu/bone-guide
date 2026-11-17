@@ -93,9 +93,12 @@ the bone.
 |---|---|---|
 | **Bone** | none | The bone the curve lies on. One solid or mesh body. |
 | **Shapes** | empty | Drill cylinders and other bodies (solid or mesh), or an alpha shape. A body that is one plain cylinder is used as its exact cylinder; any other body by its triangles. |
-| **Margin** | 2.4 mm | Grows every shape by this much before the closing - the cannula and the wall round it on a drill cylinder. Use 0 for a picked alpha shape. |
+| **Margin** | 2.4 mm | Grows every shape in **Shapes** by this much before the closing - the cannula and the wall round it on a drill cylinder. Use 0 for a picked alpha shape. |
+| **Shapes, own margin** | empty | Bodies that take **Their margin** instead - a cutting guide next to the drills, say. A body picked in both boxes takes this margin. |
+| **Their margin** | 1 mm | The margin of the bodies in **Shapes, own margin**. |
 | **Closing radius** | 3.5 mm | The alpha radius: gaps between the shapes narrower than twice this are filled. 0 cuts the shapes with the bone as they are. |
 | **Closing** | In planes across the drills (alpha shape) | **In planes across the drills (alpha shape)**: closes section by section in planes across the cylinders' mean axis; side tabs that wrap round the bone edge stay with the rest. **3D**: closes with a ball, the same in every direction. |
+| **Join every shape** | on | A shape further from the others than the closing bridges ends up on its own island. On: each island is joined to the region the other shapes are in by a strip along the shortest path over the bone, as wide as the closing radius (at least 1 mm each side). Off: islands are left out and named in the text box. A drill that also cuts the main region is never bridged where it comes out of the far cortex. |
 | **Or a curve** | empty | A closed sketch curve (one, or several that join) to lay on the bone and edit. A single fitted spline keeps its own fit points. |
 | **Edit curve** | off | On: the curve is made and the mouse edits it. While it is on, the inputs above are locked. |
 | **Influence distance** | 0 mm | 0: only the dragged point moves, as in a sketch spline. Above 0: fit points within this distance along the curve follow, less and less with distance (cosine fall-off). |
@@ -121,9 +124,13 @@ folder).
 
 - The text box shows the number of fit points and the curve length. From shapes it
   also shows the closing used, the length of the loop kept, how many other loops
-  on the bone were left out (where drills come out of the far cortex, small
-  islands) and the time taken. Only the longest loop is kept: check it is the one
-  you want.
+  on the bone were left out (where drills come out of the far cortex) and the time
+  taken. The loop kept is the outer edge of the region holding the most shapes.
+- Every shape the curve does not simply hold is named: **joined** (it was on an
+  island, with the length of the strip), **left out** (an island, with Join every
+  shape off), or **does not reach the bone** (with how far short it stops even
+  after its margin; more than 5 mm is reported as such). A drill that stops above
+  the bone cannot be in the curve - lengthen it to the bone or raise its margin.
 - The overlay is drawn 0.15 mm off the bone so it stays visible. The written
   spline passes through the fit points on the bone; between fit points a sketch
   spline can leave the bone slightly, more where the points are far apart on a
@@ -285,8 +292,9 @@ Pick the **bone** (a solid or mesh body), then one of:
     in planes across the cylinders' mean axis, as an alpha shape lofted through
     plane sections is built; *3D* closes with a ball.
   A cylinder body is used as its exact cylinder; other bodies by their triangles.
-  The longest loop on the bone is kept; the others (where drills come out of
-  the far cortex, small islands) are counted in the dialog.
+  The loop round the region holding the most shapes is kept; shapes on islands
+  are joined to it (**Join every shape**) or named as left out, and shapes that do
+  not reach the bone are named with the gap.
 - **Or a curve**: a closed sketch curve, laid on the bone. A single fitted spline
   keeps its own fit points.
 - Neither: each click on the bone adds a point.

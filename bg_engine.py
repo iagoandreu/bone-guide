@@ -26,7 +26,7 @@ import numpy as np
 import trimesh
 from scipy.ndimage import gaussian_filter1d
 from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import connected_components
+from scipy.sparse.csgraph import connected_components, dijkstra
 from scipy.spatial import cKDTree
 
 
@@ -222,55 +222,82 @@ class Shapes:
     for cylinders; for bodies, the distance to the nearest dense sample of their
     mesh signed by its normal, made exact (closest point) near the surface."""
 
-    def __init__(self, shapes, step=0.2):
+    def __init__(self, shapes, step=0.2, margin=0.0):
+        # every shape carries its own margin (the default where it has none), so
+        # U = min over the shapes of (signed distance - its margin)
         self.cyl, self.mesh = [], []
-        for sh in shapes:
+        self.items = []
+        for i, sh in enumerate(shapes):
+            m = float(sh.get('margin', margin))
+            name = sh.get('name') or 'shape %d' % (i + 1)
             if sh['kind'] == 'cyl':
-                self.cyl.append((np.asarray(sh['p0'], float), np.asarray(sh['p1'], float),
-                                 float(sh['r'])))
+                c = (np.asarray(sh['p0'], float), np.asarray(sh['p1'], float),
+                     float(sh['r']), m)
+                self.cyl.append(c)
+                self.items.append(('cyl', c, m, name))
             else:
                 V = np.fromfile(sh['coords'], '<f8').reshape(-1, 3)
                 F = np.fromfile(sh['tris'], '<i4').reshape(-1, 3)
-                self.mesh.append(Bone(V, F, step=step))
+                b = (Bone(V, F, step=step), m)
+                self.mesh.append(b)
+                self.items.append(('mesh', b, m, name))
         self.step = step
+        self.max_margin = max([it[2] for it in self.items] or [0.0])
 
     def points(self):
         """Points whose hull holds every shape (for bounds in any frame)."""
-        P = [m.mesh.vertices for m in self.mesh]
-        for p0, p1, r in self.cyl:
+        P = [m.mesh.vertices for m, _mg in self.mesh]
+        for p0, p1, r, _mg in self.cyl:
             c = np.array(list(np.ndindex(2, 2, 2)), float) * 2 - 1
             P.append(np.vstack([p0 + r * c, p1 + r * c]))
         return np.vstack(P)
 
-    def sdf(self, X, reach=np.inf):
-        """U at X; points further than reach from every shape may be +inf."""
-        U = np.full(len(X), np.inf)
-        for p0, p1, r in self.cyl:
+    def _one(self, it, X, reach):
+        """(indices into X within reach of this grown shape, its signed distance
+        there less its margin)."""
+        kind, data, mg, _name = it
+        reach = reach + mg
+        if kind == 'cyl':
+            p0, p1, r, _ = data
             lo = np.minimum(p0, p1) - r - reach
             hi = np.maximum(p0, p1) + r + reach
             sel = np.where(np.all((X >= lo) & (X <= hi), axis=1))[0]
+            d = np.empty(len(sel))
             for k0 in range(0, len(sel), 2_000_000):
                 s = sel[k0:k0 + 2_000_000]
-                U[s] = np.minimum(U[s], capped_cylinder_sdf(X[s], p0, p1, r))
-        for m in self.mesh:
-            lo, hi = m.mesh.bounds
-            sel = np.where(np.all((X >= lo - reach) & (X <= hi + reach), axis=1))[0]
-            dd, i = m.kd.query(X[sel], workers=-1)
-            d = dd * np.where(np.einsum('ij,ij->i', X[sel] - m.P[i], m.N[i]) >= 0, 1, -1)
-            near = np.abs(d) < 3 * self.step
-            if near.any():
-                Pc, Nc, _ = m.closest(X[sel][near])
-                q = X[sel][near] - Pc
-                d[near] = np.linalg.norm(q, axis=1) * np.where(
-                    np.einsum('ij,ij->i', q, Nc) >= 0, 1, -1)
+                d[k0:k0 + len(s)] = capped_cylinder_sdf(X[s], p0, p1, r)
+            return sel, d - mg
+        m = data[0]
+        lo, hi = m.mesh.bounds
+        sel = np.where(np.all((X >= lo - reach) & (X <= hi + reach), axis=1))[0]
+        dd, i = m.kd.query(X[sel], workers=-1)
+        d = dd * np.where(np.einsum('ij,ij->i', X[sel] - m.P[i], m.N[i]) >= 0, 1, -1)
+        near = np.abs(d) < 3 * self.step
+        if near.any():
+            Pc, Nc, _ = m.closest(X[sel][near])
+            q = X[sel][near] - Pc
+            d[near] = np.linalg.norm(q, axis=1) * np.where(
+                np.einsum('ij,ij->i', q, Nc) >= 0, 1, -1)
+        return sel, d - mg
+
+    def sdf(self, X, reach=np.inf):
+        """U at X, each shape less its own margin; points further than reach
+        from every grown shape may be +inf."""
+        U = np.full(len(X), np.inf)
+        for it in self.items:
+            sel, d = self._one(it, X, reach)
             U[sel] = np.minimum(U[sel], d)
         return U
+
+    def each(self, X, reach):
+        """Per shape, in pick order: (name, indices within reach, U there)."""
+        return [(it[3],) + self._one(it, X, reach) for it in self.items]
 
     def mean_axis(self):
         """The cylinders' mean axis (signs agreed), or None without cylinders."""
         if not self.cyl:
             return None
-        A = np.array([(p1 - p0) / np.linalg.norm(p1 - p0) for p0, p1, _ in self.cyl])
+        A = np.array([(p1 - p0) / np.linalg.norm(p1 - p0) for p0, p1, _r, _m in self.cyl])
         A *= np.where(A @ A[0] < 0, -1, 1)[:, None]
         n = A.sum(0)
         return n / np.linalg.norm(n)
@@ -336,7 +363,7 @@ def iso_loops(V, F, f):
 
 
 def section(bone, shapes, margin=0.0, closing=0.0, planes=True, h=None,
-            max_voxels=14e6, log=None):
+            max_voxels=14e6, log=None, join=True):
     """Where the bone surface meets the shapes' alpha shape - cylinders and
     bodies grown by margin, then closed with radius rho - as closed loops on the
     bone, longest first.
@@ -358,18 +385,18 @@ def section(bone, shapes, margin=0.0, closing=0.0, planes=True, h=None,
     is the bone's neighbourhood of the shapes plus 2 rho."""
     log = log or (lambda *_: None)
     from scipy import ndimage
-    S = Shapes(shapes)
+    S = Shapes(shapes, margin=margin)
     V, F = bone.mesh.vertices, bone.mesh.faces
     info = {'closing': 'none'}
     if closing <= 0:
         f = np.full(len(V), 1e3)
-        U = S.sdf(V, reach=margin + 1.0) - margin
+        U = S.sdf(V, reach=1.0)
         f[np.isfinite(U)] = U[np.isfinite(U)]
     else:
         n = S.mean_axis() if planes else None
         R = frame_across(n) if n is not None else np.eye(3)
         info['closing'] = 'planes across the drills' if n is not None else '3D'
-        pad = margin + 2.0 * closing + 1.0
+        pad = S.max_margin + 2.0 * closing + 1.0
         Ls, Lb = S.points() @ R.T, V @ R.T
         lo = np.maximum(Ls.min(0) - pad, Lb.min(0) - pad)
         hi = np.minimum(Ls.max(0) + pad, Lb.max(0) + pad)
@@ -380,7 +407,7 @@ def section(bone, shapes, margin=0.0, closing=0.0, planes=True, h=None,
         dims = np.ceil((hi - lo) / h).astype(int) + 1
         axes = [lo[k] + h * np.arange(dims[k]) for k in range(3)]
         L = np.stack(np.meshgrid(*axes, indexing='ij'), -1).reshape(-1, 3)
-        U = (S.sdf(L @ R, reach=margin + closing + 2 * h) - margin).reshape(tuple(dims))
+        U = S.sdf(L @ R, reach=closing + 2 * h).reshape(tuple(dims))
         del L
         log('shape field %d x %d x %d voxels of %.3f mm' % (dims[0], dims[1], dims[2], h))
         g = (Lb - lo) / h
@@ -418,11 +445,104 @@ def section(bone, shapes, margin=0.0, closing=0.0, planes=True, h=None,
         f = np.full(len(V), 1e3)
         f[inside] = ndimage.map_coordinates(C, g[inside].T, order=1)
         info.update({'voxel_mm': float(h), 'grid': dims.tolist()})
+    f, main, report = account(bone, S, f, closing, join)
     loops, chains = iso_loops(V, F, f)
     loops.sort(key=lambda L: -arclength(L)[-1])
+    if main is not None and len(loops) > 1:
+        # the curve is the outer edge of the region the shapes are in, not just
+        # the longest loop: of the loops along that region, the longest
+        kd = cKDTree(V[main])
+        edge = 2.0 * bone.max_edge + 0.5
+        on = [i for i, L in enumerate(loops) if np.median(kd.query(L)[0]) < edge]
+        if on:
+            loops.insert(0, loops.pop(on[0]))
     info.update({'loops': len(loops), 'open_chains': len(chains),
-                 'loop_mm': [float(arclength(L)[-1]) for L in loops[:8]]})
+                 'loop_mm': [float(arclength(L)[-1]) for L in loops[:8]],
+                 'shapes': report})
     return loops, info
+
+
+def bone_graph(bone):
+    """The bone's edges as a sparse graph weighted by length (cached)."""
+    g = getattr(bone, '_graph', None)
+    if g is None:
+        E = bone.mesh.edges_unique
+        w = bone.mesh.edges_unique_length
+        n = len(bone.mesh.vertices)
+        g = coo_matrix((np.r_[w, w], (np.r_[E[:, 0], E[:, 1]], np.r_[E[:, 1], E[:, 0]])),
+                       shape=(n, n)).tocsr()
+        bone._graph = g
+    return g
+
+
+def regions(bone, mask):
+    """Labels of the connected pieces of the bone's vertices in mask (-1 off)."""
+    E = bone.mesh.edges_unique
+    k = mask[E[:, 0]] & mask[E[:, 1]]
+    n = len(mask)
+    g = coo_matrix((np.ones(k.sum()), (E[k, 0], E[k, 1])), shape=(n, n))
+    _, lab = connected_components(g, directed=False)
+    return np.where(mask, lab, -1)
+
+
+def account(bone, S, f, closing, join):
+    """Which shapes the region f < 0 holds, and bridges to the ones it does not.
+
+    A shape's footprint is where it, grown by its margin, meets the bone. The
+    main region is the piece of f < 0 holding the most footprints. A shape with
+    footprint only elsewhere sits on an island; with join, the island is tied to
+    the main region by a strip along the shortest path over the bone, as wide as
+    the closing (at least 1 mm each side). A shape that reaches the main region
+    is in, whatever else it cuts (a drill also cuts the far cortex). A shape that
+    does not meet the bone is reported with how far short it stops."""
+    V = bone.mesh.vertices
+    inside = f < 0
+    per = S.each(V, reach=5.0)
+    if not inside.any():
+        return f, None, [{'name': nm, 'status': 'off'} for nm, _s, _u in per]
+    lab = regions(bone, inside)
+    foot = [sel[u <= 0] for _nm, sel, u in per]
+    counts = {}
+    for fv in foot:
+        for L in set(lab[fv][lab[fv] >= 0].tolist()):
+            counts[L] = counts.get(L, 0) + 1
+    if not counts:
+        return f, None, [{'name': nm, 'status': 'off'} for nm, _s, _u in per]
+    sizes = np.bincount(lab[lab >= 0])
+    main_l = max(counts, key=lambda L: (counts[L], sizes[L]))
+    main = np.where(lab == main_l)[0]
+    report, bridges = [], []
+    for (name, sel, u), fv in zip(per, foot):
+        if len(fv) == 0:
+            row = {'name': name, 'status': 'off'}
+            if len(u):
+                row['gap_mm'] = float(u.min())
+            report.append(row)
+        elif np.any(lab[fv] == main_l):
+            report.append({'name': name, 'status': 'in'})
+        elif not join:
+            report.append({'name': name, 'status': 'out'})
+        else:
+            pieces = np.unique(lab[fv][lab[fv] >= 0])
+            bridges.append((name, np.unique(np.r_[fv, np.where(np.isin(lab, pieces))[0]])))
+    if bridges:
+        dist, pred, _src = dijkstra(bone_graph(bone), directed=False, indices=main,
+                                    min_only=True, return_predecessors=True)
+        w = max(closing, 1.0)
+        for name, isl in bridges:
+            k = isl[np.argmin(dist[isl])]
+            if not np.isfinite(dist[k]):
+                report.append({'name': name, 'status': 'out'})
+                continue
+            path = [k]
+            while pred[path[-1]] >= 0:
+                path.append(pred[path[-1]])
+            P = resample(V[path], 0.2, closed=False) if len(path) > 1 else V[path]
+            near = np.where(np.all((V >= P.min(0) - w - 1) & (V <= P.max(0) + w + 1), 1))[0]
+            d, _ = cKDTree(P).query(V[near], workers=-1)
+            f[near] = np.minimum(f[near], d - w)
+            report.append({'name': name, 'status': 'joined', 'bridge_mm': float(dist[k])})
+    return f, main, report
 
 
 def frames(Q, N, step, closed=True, normal_mm=1.5):
@@ -953,7 +1073,8 @@ def serve():
                 t0 = time.time()
                 loops, info = section(bone, req['shapes'], float(req.get('margin', 0.0)),
                                       float(req.get('closing', 0.0)),
-                                      bool(req.get('planes', True)), max_voxels=8e6)
+                                      bool(req.get('planes', True)), max_voxels=8e6,
+                                      join=bool(req.get('join', True)))
                 if not loops:
                     raise GuideError('the shapes do not cut the bone surface')
                 P, _ = attach(bone, loops[0], 0.1, float(req.get('smooth', 0.5)))
